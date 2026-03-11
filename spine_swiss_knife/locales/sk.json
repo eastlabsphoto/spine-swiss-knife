@@ -358,5 +358,13 @@
   "done.title": "Hotovo",
   "created.title": "Vytvorené",
   "warnings.title": "Upozornenia",
-  "empty.title": "Prázdne"
+  "empty.title": "Prázdne",
+
+  "update.available": "Dostupná aktualizácia: v{version}",
+  "update.btn": "Aktualizovať",
+  "update.confirm": "Stiahnuť a nainštalovať v{version}?\n\n{changelog}\n\nAplikácia sa automaticky reštartuje.",
+  "update.downloading": "Sťahovanie aktualizácie...",
+  "update.installing": "Inštalácia aktualizácie...",
+  "update.failed": "Aktualizácia zlyhala: {error}",
+  "update.restart": "Aktualizácia nainštalovaná. Reštartujem..."
 }

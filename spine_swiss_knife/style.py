@@ -389,4 +389,28 @@ QToolTip {{
     border-radius: 4px;
     padding: 4px 8px;
 }}
+
+/* ── Update banner ── */
+#updateBanner {{
+    background-color: {ACCENT_DARK};
+    border: 1px solid {ACCENT};
+    border-radius: 8px;
+    padding: 6px 12px;
+}}
+#updateBanner QLabel {{
+    color: {TEXT};
+    font-size: 12px;
+    background: transparent;
+}}
+#updateBanner QPushButton {{
+    background-color: {ACCENT};
+    color: {BASE};
+    font-weight: bold;
+    border-radius: 4px;
+    padding: 4px 14px;
+    font-size: 12px;
+}}
+#updateBanner QPushButton:hover {{
+    background-color: {ACCENT_HOVER};
+}}
 """

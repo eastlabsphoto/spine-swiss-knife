@@ -358,5 +358,13 @@
   "done.title": "Done",
   "created.title": "Created",
   "warnings.title": "Warnings",
-  "empty.title": "Empty"
+  "empty.title": "Empty",
+
+  "update.available": "Update available: v{version}",
+  "update.btn": "Update Now",
+  "update.confirm": "Download and install v{version}?\n\n{changelog}\n\nThe app will restart automatically.",
+  "update.downloading": "Downloading update...",
+  "update.installing": "Installing update...",
+  "update.failed": "Update failed: {error}",
+  "update.restart": "Update installed. Restarting..."
 }

@@ -4,6 +4,7 @@ import sys
 from PySide6.QtWidgets import QApplication
 from .app import SpineSwissKnifeApp
 from .style import STYLESHEET
+from .updater import UpdateChecker
 
 
 def main():
@@ -11,6 +12,12 @@ def main():
     app.setStyleSheet(STYLESHEET)
     window = SpineSwissKnifeApp()
     window.show()
+
+    # Check for updates in background
+    checker = UpdateChecker(window)
+    checker.update_available.connect(window.show_update_available)
+    checker.start()
+
     sys.exit(app.exec())
 
 

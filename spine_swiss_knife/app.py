@@ -7,11 +7,13 @@ from pathlib import Path
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QTabWidget, QFileDialog,
-    QStackedWidget, QSizePolicy, QComboBox,
+    QStackedWidget, QSizePolicy, QComboBox, QFrame, QMessageBox,
+    QProgressDialog,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon
 
+from . import __version__
 from .i18n import tr, set_language, language_changed
 from .project_analyzer import ProjectAnalyzerTab
 from .optimizer import OptimizerTab
@@ -46,7 +48,7 @@ _SIDEBAR_KEYS = [
 class SpineSwissKnifeApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("GreentubeSK Spine Swiss Knife")
+        self.setWindowTitle(f"GreentubeSK Spine Swiss Knife v{__version__}")
         self.resize(1200, 800)
         self.setMinimumSize(900, 600)
         icon_path = Path(__file__).parent / "resources" / "icon.png"
@@ -101,6 +103,25 @@ class SpineSwissKnifeApp(QMainWindow):
         main_layout = QVBoxLayout(main_area)
         main_layout.setContentsMargins(12, 12, 12, 12)
         main_layout.setSpacing(8)
+
+        # Update banner (hidden by default)
+        self._update_banner = QFrame()
+        self._update_banner.setObjectName("updateBanner")
+        banner_layout = QHBoxLayout(self._update_banner)
+        banner_layout.setContentsMargins(8, 4, 8, 4)
+        self._update_label = QLabel("")
+        self._update_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        banner_layout.addWidget(self._update_label)
+        self._update_btn = QPushButton(tr("update.btn"))
+        self._update_btn.setCursor(Qt.PointingHandCursor)
+        self._update_btn.clicked.connect(self._do_update)
+        banner_layout.addWidget(self._update_btn)
+        self._update_banner.hide()
+        main_layout.addWidget(self._update_banner)
+
+        # Store update info for later use
+        self._pending_update_url = ""
+        self._pending_update_changelog = ""
 
         # Config panel
         config_panel = QWidget()
@@ -173,7 +194,8 @@ class SpineSwissKnifeApp(QMainWindow):
             set_language(lang)
 
     def _retranslate(self):
-        self.setWindowTitle("GreentubeSK Spine Swiss Knife")
+        self.setWindowTitle(f"GreentubeSK Spine Swiss Knife v{__version__}")
+        self._update_btn.setText(tr("update.btn"))
         self._title_label.setText(tr("app.title"))
         self._json_label.setText(tr("app.json_label"))
         self._json_edit.setPlaceholderText(tr("app.json_placeholder"))
@@ -289,3 +311,42 @@ class SpineSwissKnifeApp(QMainWindow):
                 tabs[11]._load()
             except Exception:
                 pass
+
+    # --- Auto-update ---
+
+    def show_update_available(self, version: str, zipball_url: str, changelog: str):
+        self._pending_update_url = zipball_url
+        self._pending_update_changelog = changelog
+        self._update_label.setText(tr("update.available", version=version))
+        self._update_banner.show()
+
+    def _do_update(self):
+        from .updater import perform_update, restart_app
+
+        msg = tr("update.confirm",
+                 version=self._update_label.text(),
+                 changelog=self._pending_update_changelog or "—")
+        reply = QMessageBox.question(self, tr("confirm.title"), msg,
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        progress = QProgressDialog(tr("update.downloading"), None, 0, 0, self)
+        progress.setWindowTitle(tr("update.btn"))
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setCancelButton(None)
+        progress.show()
+
+        try:
+            from PySide6.QtWidgets import QApplication
+            QApplication.processEvents()
+            progress.setLabelText(tr("update.installing"))
+            QApplication.processEvents()
+            perform_update(self._pending_update_url)
+            progress.close()
+            QMessageBox.information(self, tr("done.title"), tr("update.restart"))
+            restart_app()
+        except Exception as e:
+            progress.close()
+            QMessageBox.warning(self, tr("err.title"),
+                                tr("update.failed", error=str(e)))
