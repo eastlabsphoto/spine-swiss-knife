@@ -1,0 +1,118 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+      should_build: ${{ steps.check_release.outputs.should_build }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from __init__.py
+        id: get_version
+        run: |
+          VERSION=$(python3 -c "import re; print(re.search(r\"__version__\s*=\s*[\\\"']([^\\\"']+)[\\\"']\", open('spine_swiss_knife/__init__.py').read()).group(1))")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Detected version: $VERSION"
+
+      - name: Check if release already exists
+        id: check_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v${{ steps.get_version.outputs.version }}" > /dev/null 2>&1; then
+            echo "Release v${{ steps.get_version.outputs.version }} already exists, skipping build."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "No release found, will build."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-macos:
+    needs: check-version
+    if: needs.check-version.outputs.should_build == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build with PyInstaller
+        run: pyinstaller spine_swiss_knife.spec
+
+      - name: Zip .app bundle
+        run: |
+          cd dist
+          zip -r ../SpineSwissKnife-macOS.zip SpineSwissKnife.app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-build
+          path: SpineSwissKnife-macOS.zip
+
+  build-windows:
+    needs: check-version
+    if: needs.check-version.outputs.should_build == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build with PyInstaller
+        run: pyinstaller spine_swiss_knife.spec
+
+      - name: Zip Windows build
+        run: Compress-Archive -Path dist/SpineSwissKnife -DestinationPath SpineSwissKnife-Windows.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: SpineSwissKnife-Windows.zip
+
+  release:
+    needs: [check-version, build-macos, build-windows]
+    if: needs.check-version.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-build
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-build
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          gh release create "v${VERSION}" \
+            --title "Spine Swiss Knife v${VERSION}" \
+            --generate-notes \
+            SpineSwissKnife-macOS.zip \
+            SpineSwissKnife-Windows.zip

@@ -2,11 +2,13 @@
 
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import webbrowser
 import zipfile
 from pathlib import Path
 from urllib.error import URLError
@@ -20,7 +22,10 @@ _REPO = "eastlabsphoto/spine-swiss-knife"
 _RAW_INIT = f"https://raw.githubusercontent.com/{_REPO}/main/spine_swiss_knife/__init__.py"
 _ZIP_URL = f"https://github.com/{_REPO}/archive/refs/heads/main.zip"
 _COMMITS_URL = f"https://api.github.com/repos/{_REPO}/commits?per_page=10"
+_RELEASES_URL = f"https://github.com/{_REPO}/releases/latest"
 _APP_DIR = Path(__file__).parent
+
+IS_FROZEN = getattr(sys, "frozen", False)
 
 _VERSION_RE = re.compile(r'__version__\s*=\s*["\']([^"\']+)["\']')
 
@@ -73,7 +78,14 @@ class UpdateChecker(QThread):
 
 
 def perform_update(zip_url: str) -> None:
-    """Download main branch ZIP, extract, replace spine_swiss_knife/ contents."""
+    """Download main branch ZIP, extract, replace spine_swiss_knife/ contents.
+
+    For frozen builds (PyInstaller .exe/.app), opens browser to releases page instead.
+    """
+    if IS_FROZEN:
+        webbrowser.open(_RELEASES_URL)
+        return
+
     tmp_dir = tempfile.mkdtemp(prefix="ssk_update_")
     zip_path = os.path.join(tmp_dir, "release.zip")
 
@@ -112,6 +124,11 @@ def perform_update(zip_url: str) -> None:
 
 
 def restart_app() -> None:
-    """Restart the application by launching a new process and exiting."""
+    """Restart the application by launching a new process and exiting.
+
+    For frozen builds, just exits (user already got the releases page).
+    """
+    if IS_FROZEN:
+        sys.exit(0)
     subprocess.Popen([sys.executable] + sys.argv)
     sys.exit(0)
