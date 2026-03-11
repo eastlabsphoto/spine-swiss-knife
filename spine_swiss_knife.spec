@@ -2,11 +2,16 @@
 """PyInstaller spec for Spine Swiss Knife."""
 
 import platform
+import re
 
 block_cipher = None
 
+# Read version dynamically
+with open('spine_swiss_knife/__init__.py') as _f:
+    _VERSION = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', _f.read()).group(1)
+
 a = Analysis(
-    ['spine_swiss_knife/__main__.py'],
+    ['pyinstaller_entry.py'],
     pathex=[],
     binaries=[],
     datas=[
@@ -51,7 +56,7 @@ if platform.system() == 'Darwin':
         icon='spine_swiss_knife/resources/icon.icns',
         bundle_identifier='com.greentube.spineswissknife',
         info_plist={
-            'CFBundleShortVersionString': '0.1.1',
+            'CFBundleShortVersionString': _VERSION,
             'NSHighResolutionCapable': True,
         },
     )
