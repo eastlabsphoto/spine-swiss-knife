@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QComboBox,
     QTabWidget, QTextEdit, QMessageBox,
 )
-from PySide6.QtGui import QTextCharFormat, QColor, QFont
+from PySide6.QtGui import QTextCharFormat, QColor, QFont, QTextCursor
 
 from .i18n import tr, language_changed
 from .spine_json import load_spine_json
@@ -304,7 +304,7 @@ class SpineDowngraderTab:
         if bold:
             fmt.setFontWeight(QFont.Bold)
         cursor = self._log.textCursor()
-        cursor.movePosition(cursor.End)
+        cursor.movePosition(QTextCursor.MoveOperation.End)
         cursor.insertText(text + "\n", fmt)
         self._log.setTextCursor(cursor)
         self._log.ensureCursorVisible()

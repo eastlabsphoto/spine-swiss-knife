@@ -279,6 +279,8 @@ class KeyframeOptimizerTab:
             redundant = info["redundant_keys"]
             grand_total += total
             grand_redundant += redundant
+            if redundant == 0:
+                continue
             pct = f"{redundant / total * 100:.1f}%" if total > 0 else "0%"
             item = QTreeWidgetItem(self._tree, [anim_name, str(total), str(redundant), pct])
             item.setCheckState(0, Qt.Checked)

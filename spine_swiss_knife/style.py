@@ -67,6 +67,23 @@ QMainWindow, QWidget {{
     padding: 12px 14px 8px 14px;
 }}
 
+#sidebar #homeButton {{
+    background-color: {SURFACE0};
+    color: {TEXT};
+    border: 1px solid {SURFACE1};
+    border-radius: 8px;
+    padding: 8px 10px;
+    text-align: left;
+    font-size: 12px;
+    font-weight: bold;
+    margin: 6px 8px 8px 8px;
+}}
+#sidebar #homeButton:hover {{
+    background-color: {SURFACE1};
+    border-color: {ACCENT};
+    color: {ACCENT};
+}}
+
 /* ── Config panel ── */
 #configPanel {{
     background-color: {SURFACE0};
@@ -412,5 +429,59 @@ QToolTip {{
 }}
 #updateBanner QPushButton:hover {{
     background-color: {ACCENT_HOVER};
+}}
+
+/* ── Welcome page ── */
+#welcomePage {{
+    background-color: {BASE};
+}}
+#welcomeTitle {{
+    font-size: 24px;
+    font-weight: bold;
+    color: {ACCENT};
+}}
+#welcomeSubtitle {{
+    font-size: 14px;
+    color: {SUBTEXT};
+    margin-bottom: 8px;
+}}
+#welcomePage QPushButton[role="welcome-primary"] {{
+    background-color: {ACCENT_DARK};
+    color: {TEXT};
+    font-size: 15px;
+    font-weight: bold;
+    padding: 16px 32px;
+    border-radius: 8px;
+    min-width: 220px;
+    min-height: 48px;
+}}
+#welcomePage QPushButton[role="welcome-primary"]:hover {{
+    background-color: #007a12;
+}}
+#welcomePage QPushButton[role="welcome-primary"]:disabled {{
+    background-color: {SURFACE1};
+    color: {OVERLAY0};
+}}
+#welcomePage QPushButton[role="welcome-secondary"] {{
+    background-color: {SURFACE1};
+    color: {TEXT};
+    font-size: 15px;
+    font-weight: bold;
+    padding: 16px 32px;
+    border-radius: 8px;
+    min-width: 220px;
+    min-height: 48px;
+}}
+#welcomePage QPushButton[role="welcome-secondary"]:hover {{
+    background-color: {SURFACE2};
+}}
+#spinePathStatus[role="ok"] {{
+    color: {ACCENT};
+}}
+#spinePathStatus[role="error"] {{
+    color: {RED};
+}}
+#spinePathStatus[role="info"] {{
+    color: {SUBTEXT};
 }}
 """
