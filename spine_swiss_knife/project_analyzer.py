@@ -372,6 +372,19 @@ class ProjectAnalyzerTab:
                 self._append(tr("analyzer.warn.mesh_detail", name=matt, slot=mslot, clips=clips_str) + "\n", "critical")
             has_critical = True
 
+        blend_slots = [s for s in spine_data.get("slots", [])
+                       if s.get("blend") in ("multiply", "screen")]
+        if blend_slots:
+            self._append(
+                tr("analyzer.warn.blend_modes_critical", count=len(blend_slots)) + "\n",
+                "critical",
+            )
+            for s in blend_slots[:5]:
+                self._append(tr("analyzer.warn.blend_detail", name=s["name"], blend=s.get("blend")) + "\n", "critical")
+            if len(blend_slots) > 5:
+                self._append(tr("analyzer.warn.more", count=len(blend_slots) - 5) + "\n", "critical")
+            has_critical = True
+
         if has_critical:
             self._append("\n")
 
@@ -497,6 +510,9 @@ class ProjectAnalyzerTab:
             if len(dead_bones) > 10:
                 self._append(tr("analyzer.warn.more", count=len(dead_bones) - 10) + "\n", "warning")
             warnings_found = True
+
+        if blend_slots:
+            self._append(tr("analyzer.warn.blend_modes", count=len(blend_slots)) + "\n", "critical")
 
         if not warnings_found:
             self._append(tr("analyzer.no_warnings") + "\n")

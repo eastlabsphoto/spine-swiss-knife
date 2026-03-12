@@ -722,7 +722,7 @@ def load_atlas_textures(atlas_path: str) -> dict[str, QPixmap]:
     atlas_dir = os.path.dirname(atlas_path)
     textures: dict[str, QPixmap] = {}
 
-    for image_name, frames in pages:
+    for image_name, frames, _page_scale in pages:
         image_path = os.path.join(atlas_dir, image_name)
         if not os.path.isfile(image_path):
             image_path = os.path.join(atlas_dir, os.path.basename(image_name))
@@ -1086,6 +1086,11 @@ class SpineGLCanvas(QOpenGLWidget):
             pw = pixmap.width()
             ph = pixmap.height()
 
+            # JSON width/height = intended display size (always at full scale).
+            # Pixmap may be smaller when atlas was exported at < 1.0 scale.
+            att_w = att.get("width", pw)
+            att_h = att.get("height", ph)
+
             bone_t = QTransform(
                 bt.a, -bt.c,
                 -bt.b, bt.d,
@@ -1095,7 +1100,7 @@ class SpineGLCanvas(QOpenGLWidget):
             att_t = QTransform()
             att_t.translate(ax, -ay)
             att_t.rotate(-a_rot)
-            att_t.scale(a_sx, a_sy)
+            att_t.scale(a_sx * att_w / pw, a_sy * att_h / ph)
             att_t.translate(-pw / 2.0, -ph / 2.0)
 
             cam_t = QTransform()
@@ -1676,6 +1681,7 @@ class SpineViewerTab:
         # Populate animation list
         animations = spine_data.get("animations", {})
         self._anim_list.blockSignals(True)
+        self._anim_list.setCurrentRow(-1)
         self._anim_list.clear()
         self._anim_list.addItem(tr("viewer.setup_pose"))
         for name in sorted(animations.keys()):
@@ -1685,10 +1691,12 @@ class SpineViewerTab:
         # Populate skin dropdown
         skins = normalize_skins(spine_data.get("skins", {}))
         self._skin_combo.blockSignals(True)
+        self._skin_combo.setCurrentIndex(-1)
         self._skin_combo.clear()
         self._skin_combo.addItem(tr("viewer.all_skins"))
         for name in sorted(skins.keys()):
             self._skin_combo.addItem(name)
+        self._skin_combo.setCurrentIndex(0)
         self._skin_combo.blockSignals(False)
 
         # Show setup pose first

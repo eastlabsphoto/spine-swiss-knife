@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QTabWidget, QFileDialog,
     QStackedWidget, QSizePolicy, QComboBox, QFrame, QMessageBox,
-    QProgressDialog,
+    QProgressDialog, QApplication,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon
@@ -22,6 +22,7 @@ from .polygon_simplify import PolygonSimplifyTab
 from .keyframe_optimizer import KeyframeOptimizerTab
 from .dead_bones import DeadBonesTab
 from .hidden_attachments import HiddenAttachmentsTab
+from .blend_switcher import BlendSwitcherTab
 from .unused_finder import UnusedFinderTab
 from .splitter import SplitterTab
 from .spine_downgrader import SpineDowngraderTab
@@ -37,6 +38,7 @@ _SIDEBAR_KEYS = [
     ("app.sidebar.keyframes", "app.tip.keyframes"),
     ("app.sidebar.dead_bones", "app.tip.dead_bones"),
     ("app.sidebar.hidden", "app.tip.hidden"),
+    ("app.sidebar.blend", "app.tip.blend"),
     ("app.sidebar.unused", "app.tip.unused"),
     ("app.sidebar.splitter", "app.tip.splitter"),
     ("app.sidebar.downgrader", "app.tip.downgrader"),
@@ -162,9 +164,27 @@ class SpineSwissKnifeApp(QMainWindow):
         main_layout.addWidget(config_panel)
 
         # Tool pages (hidden QTabWidget — sidebar controls it)
+        tab_container = QWidget()
+        tab_container_layout = QVBoxLayout(tab_container)
+        tab_container_layout.setContentsMargins(0, 0, 0, 0)
         self._tabs = QTabWidget()
         self._tabs.tabBar().setVisible(False)
-        main_layout.addWidget(self._tabs, 1)
+        tab_container_layout.addWidget(self._tabs, 1)
+
+        # Loading overlay
+        self._loading_overlay = QLabel(tr("app.loading"))
+        self._loading_overlay.setAlignment(Qt.AlignCenter)
+        self._loading_overlay.setStyleSheet(
+            "background-color: rgba(26, 26, 42, 200);"
+            "color: #6ec072;"
+            "font-size: 16px;"
+            "font-weight: bold;"
+        )
+        self._loading_overlay.setParent(tab_container)
+        self._loading_overlay.hide()
+
+        main_layout.addWidget(tab_container, 1)
+        self._tab_container = tab_container
 
         root_layout.addWidget(main_area, 1)
 
@@ -178,6 +198,7 @@ class SpineSwissKnifeApp(QMainWindow):
             KeyframeOptimizerTab(self._tabs, self._get_config, on_modified=notify),
             DeadBonesTab(self._tabs, self._get_config, on_modified=notify),
             HiddenAttachmentsTab(self._tabs, self._get_config, on_modified=notify),
+            BlendSwitcherTab(self._tabs, self._get_config, on_modified=notify),
             UnusedFinderTab(self._tabs, self._get_config),
             SplitterTab(self._tabs, self._get_config),
             SpineDowngraderTab(self._tabs, self._get_config),
@@ -196,6 +217,7 @@ class SpineSwissKnifeApp(QMainWindow):
     def _retranslate(self):
         self.setWindowTitle(f"GreentubeSK Spine Swiss Knife v{__version__}")
         self._update_btn.setText(tr("update.btn"))
+        self._loading_overlay.setText(tr("app.loading"))
         self._title_label.setText(tr("app.title"))
         self._json_label.setText(tr("app.json_label"))
         self._json_edit.setPlaceholderText(tr("app.json_placeholder"))
@@ -245,23 +267,24 @@ class SpineSwissKnifeApp(QMainWindow):
         stem = p.stem
         parent = p.parent
 
-        if not self._atlas_edit.text():
-            for pattern in (f"{stem}.atlas.txt", f"{stem}.atlas"):
-                candidate = parent / pattern
-                if candidate.is_file():
-                    self._atlas_edit.setText(str(candidate))
+        # Always re-detect atlas for the new JSON
+        atlas_found = ""
+        for pattern in (f"{stem}.atlas.txt", f"{stem}.atlas"):
+            candidate = parent / pattern
+            if candidate.is_file():
+                atlas_found = str(candidate)
+                break
+        if not atlas_found:
+            for ext in ("*.atlas.txt", "*.atlas"):
+                found = list(parent.glob(ext))
+                if found:
+                    atlas_found = str(found[0])
                     break
-            else:
-                for ext in ("*.atlas.txt", "*.atlas"):
-                    found = list(parent.glob(ext))
-                    if found:
-                        self._atlas_edit.setText(str(found[0]))
-                        break
+        self._atlas_edit.setText(atlas_found)
 
-        if not self._images_edit.text():
-            img_dir = parent / "images"
-            if img_dir.is_dir():
-                self._images_edit.setText(str(img_dir))
+        # Always re-detect images folder for the new JSON
+        img_dir = parent / "images"
+        self._images_edit.setText(str(img_dir) if img_dir.is_dir() else "")
 
     def _browse_atlas(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -279,12 +302,23 @@ class SpineSwissKnifeApp(QMainWindow):
 
     def _run_all_tabs(self):
         """Trigger analyze/load/detect on all tabs so everything is ready."""
+        overlay = self._loading_overlay
+        overlay.resize(self._tab_container.size())
+        overlay.show()
+        overlay.raise_()
+        QApplication.processEvents()
+        try:
+            self._run_all_tabs_inner()
+        finally:
+            overlay.hide()
+
+    def _run_all_tabs_inner(self):
         tabs = self._tab_instances
         has_atlas = bool(self._atlas_edit.text().strip())
         has_images = bool(self._images_edit.text().strip())
 
-        # JSON-only tabs: Analyzer, Rect Masks, Polygon, Keyframes, Dead Bones, Hidden Att.
-        for tab in [tabs[0], tabs[2], tabs[3], tabs[4], tabs[5], tabs[6]]:
+        # JSON-only tabs: Analyzer, Rect Masks, Polygon, Keyframes, Dead Bones, Hidden Att., Blend
+        for tab in [tabs[0], tabs[2], tabs[3], tabs[4], tabs[5], tabs[6], tabs[7]]:
             try:
                 tab._analyze()
             except Exception:
@@ -292,23 +326,23 @@ class SpineSwissKnifeApp(QMainWindow):
         # Unused — needs atlas + images
         if has_atlas and has_images:
             try:
-                tabs[7]._analyze()
+                tabs[8]._analyze()
             except Exception:
                 pass
         # Splitter — Load Animations
         try:
-            tabs[8]._load()
+            tabs[9]._load()
         except Exception:
             pass
         # Downgrader — Detect Version
         try:
-            tabs[9]._detect()
+            tabs[10]._detect()
         except Exception:
             pass
         # Viewer — needs atlas
         if has_atlas:
             try:
-                tabs[11]._load()
+                tabs[12]._load()
             except Exception:
                 pass
 

@@ -28,7 +28,7 @@ except ImportError:
 # Spine Atlas Parser
 # ==========================================================================
 
-def parse_spine_atlas(atlas_path: str) -> list[tuple[str, list[dict]]]:
+def parse_spine_atlas(atlas_path: str) -> list[tuple[str, list[dict], float]]:
     with open(atlas_path, "r") as f:
         lines = f.readlines()
 
@@ -36,6 +36,7 @@ def parse_spine_atlas(atlas_path: str) -> list[tuple[str, list[dict]]]:
     current_image = None
     current_frames: list[dict] = []
     current_frame: dict | None = None
+    current_page_scale: float = 1.0
 
     i = 0
     while i < len(lines):
@@ -48,9 +49,10 @@ def parse_spine_atlas(atlas_path: str) -> list[tuple[str, list[dict]]]:
                 current_frames.append(current_frame)
                 current_frame = None
             if current_image and current_frames:
-                pages.append((current_image, current_frames))
+                pages.append((current_image, current_frames, current_page_scale))
             current_image = None
             current_frames = []
+            current_page_scale = 1.0
             continue
 
         if current_image is None:
@@ -88,6 +90,13 @@ def parse_spine_atlas(atlas_path: str) -> list[tuple[str, list[dict]]]:
                 pass
         else:
             if ":" in stripped and not current_frames and current_frame is None:
+                # Page-level property (size, format, filter, scale, etc.)
+                key, value = [x.strip() for x in stripped.split(":", 1)]
+                if key == "scale":
+                    try:
+                        current_page_scale = float(value)
+                    except ValueError:
+                        pass
                 continue
             if current_frame:
                 current_frames.append(current_frame)
@@ -96,7 +105,7 @@ def parse_spine_atlas(atlas_path: str) -> list[tuple[str, list[dict]]]:
     if current_frame:
         current_frames.append(current_frame)
     if current_image and current_frames:
-        pages.append((current_image, current_frames))
+        pages.append((current_image, current_frames, current_page_scale))
 
     return pages
 
@@ -110,7 +119,7 @@ def extract_spine_frames(atlas_path: str, output_dir: str) -> int:
     atlas_dir = os.path.dirname(atlas_path)
     count = 0
 
-    for image_name, frames in pages:
+    for image_name, frames, _scale in pages:
         image_path = os.path.join(atlas_dir, image_name)
         try:
             atlas_image = Image.open(image_path)
@@ -396,7 +405,7 @@ class TextureUnpackerTab:
         if ext == ".atlas":
             pages = parse_spine_atlas(file_path)
             atlas_dir = os.path.dirname(file_path)
-            for img_name, frames in pages:
+            for img_name, frames, _scale in pages:
                 img_path = os.path.join(atlas_dir, img_name)
                 if not os.path.isfile(img_path):
                     continue
