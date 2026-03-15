@@ -37,6 +37,7 @@ from .splitter import SplitterTab
 from .spine_downgrader import SpineDowngraderTab
 from .texture_unpacker import TextureUnpackerTab
 from .spine_viewer import SpineViewerTab
+from .static_exporter import StaticExporterTab
 from .debug_log import DebugConsole
 
 
@@ -54,6 +55,7 @@ _SIDEBAR_KEYS = [
     ("app.sidebar.downgrader", "app.tip.downgrader"),
     ("app.sidebar.unpacker", "app.tip.unpacker"),
     ("app.sidebar.viewer", "app.tip.viewer"),
+    ("app.sidebar.static_export", "app.tip.static_export"),
 ]
 
 
@@ -275,6 +277,7 @@ class SpineSwissKnifeApp(QMainWindow):
             SpineDowngraderTab(self._tabs, self._get_config),
             TextureUnpackerTab(self._tabs, self._get_config),
             SpineViewerTab(self._tabs, self._get_config),
+            StaticExporterTab(self._tabs, self._get_config),
         ]
 
         # Select first tool
@@ -598,6 +601,12 @@ class SpineSwissKnifeApp(QMainWindow):
             return self._atlas_edit.text().strip()
         elif key == "images":
             return self._images_edit.text().strip()
+        elif key == "spine":
+            return getattr(self, "_spine_project_path", "")
+        elif key == "spine_exe":
+            return settings.spine_executable() or ""
+        elif key == "mode":
+            return self._mode or ""
         return ""
 
     # --- Browse dialogs ---
@@ -694,6 +703,11 @@ class SpineSwissKnifeApp(QMainWindow):
                 tabs[12]._load()
             except Exception:
                 pass
+        # Static Exporter — reads animation list from JSON
+        try:
+            tabs[13]._load()
+        except Exception:
+            pass
 
     # --- Auto-update ---
 

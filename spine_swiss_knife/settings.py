@@ -38,5 +38,12 @@ class _Settings:
     def set_language(self, lang: str):
         self._qs.setValue("language", lang)
 
+    # -- Static export settings file --
+    def static_export_settings(self) -> str:
+        return self._qs.value("static_export_settings", "", type=str)
+
+    def set_static_export_settings(self, path: str):
+        self._qs.setValue("static_export_settings", path)
+
 
 settings = _Settings()

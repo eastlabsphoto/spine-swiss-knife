@@ -398,6 +398,116 @@ def export_spine_project(
     )
 
 
+def export_first_frames(
+    exe: str,
+    spine_file: str,
+    output_dir: str,
+    export_settings: dict,
+    animations: list[str],
+    timeout: int = 600,
+    on_output: Optional[Callable[[str], None]] = None,
+) -> dict[str, str]:
+    """Export animation frames as PNG via Spine CLI.
+
+    *export_settings* is a dict with Spine CLI ``export-png`` fields.
+    The ``output`` and ``open`` keys are overridden automatically.
+
+    Returns a dict mapping animation name -> output PNG path.
+    """
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    settings = dict(export_settings)
+    settings["output"] = str(out.resolve())
+    settings["open"] = False
+
+    # Write temp settings with overridden output
+    fd, tmp_path = tempfile.mkstemp(suffix=".json", prefix="ssk_img_")
+    try:
+        with open(fd, "w", encoding="utf-8") as f:
+            _json.dump(settings, f)
+    except Exception:
+        import os
+        os.close(fd)
+        raise
+
+    try:
+        cmd = [exe]
+        version = read_spine_file_version(spine_file)
+        if version:
+            cmd += ["-u", version]
+        cmd += ["-i", spine_file, "-e", tmp_path]
+
+        if on_output:
+            on_output(f"Running: {' '.join(cmd)}")
+
+        try:
+            rc, stdout, stderr = _run_cli(cmd, timeout=timeout, on_output=on_output)
+        except Exception as e:
+            if on_output:
+                on_output(f"ERROR: {e}")
+            return {}
+
+        if rc != 0:
+            if on_output:
+                on_output(f"Export failed (exit {rc}): {stderr}")
+            return {}
+    finally:
+        try:
+            Path(tmp_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    # Scan output dir for PNGs and match to animation names.
+    # Spine typically outputs: <anim_name>/<frame>.png  or  <anim_name>.png
+    # For fps=1, first frame is usually 0000.png or the only file.
+    results: dict[str, str] = {}
+    anim_set = set(animations)
+
+    for png in sorted(out.rglob("*.png")):
+        # Try matching by parent folder name (Spine puts each anim in subdir)
+        folder_name = png.parent.name
+        if folder_name in anim_set and folder_name not in results:
+            results[folder_name] = str(png)
+            continue
+        # Try matching by file stem
+        stem = png.stem
+        # Strip trailing frame numbers (e.g. "walk0000" -> "walk")
+        clean = stem.rstrip("0123456789") or stem
+        if clean in anim_set and clean not in results:
+            results[clean] = str(png)
+
+    # For animations not yet matched, try looser matching
+    for anim in animations:
+        if anim in results:
+            continue
+        for png in sorted(out.rglob("*.png")):
+            if anim.lower() in png.stem.lower() or anim.lower() in png.parent.name.lower():
+                results[anim] = str(png)
+                break
+
+    # Delete everything that wasn't matched to a selected animation
+    matched_paths = set(Path(p) for p in results.values())
+    for png in list(out.rglob("*.png")):
+        if png not in matched_paths:
+            try:
+                png.unlink()
+            except OSError:
+                pass
+    # Clean up empty subdirectories
+    for d in sorted(out.rglob("*"), reverse=True):
+        if d.is_dir():
+            try:
+                d.rmdir()  # only removes if empty
+            except OSError:
+                pass
+
+    if on_output:
+        on_output(f"Found {len(results)}/{len(animations)} animation frame(s)")
+
+    return results
+
+
 def import_to_spine_project(
     exe: str, json_path: str, spine_file: str,
     timeout: int = 600,
