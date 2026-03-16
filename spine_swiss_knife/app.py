@@ -19,7 +19,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon
 
 from . import __version__
-from .i18n import tr, set_language, language_changed
+from .i18n import tr, language_changed
 from .settings import settings
 from .spine_cli import export_spine_project, import_to_spine_project
 from .spine_downgrader import SpineDowngraderTab, convert_to_destination
@@ -32,7 +32,6 @@ from .keyframe_optimizer import KeyframeOptimizerTab
 from .dead_bones import DeadBonesTab
 from .hidden_attachments import HiddenAttachmentsTab
 from .blend_switcher import BlendSwitcherTab
-from .unused_finder import UnusedFinderTab
 from .splitter import SplitterTab
 from .spine_downgrader import SpineDowngraderTab
 from .texture_unpacker import TextureUnpackerTab
@@ -50,12 +49,11 @@ _SIDEBAR_KEYS = [
     ("app.sidebar.dead_bones", "app.tip.dead_bones"),
     ("app.sidebar.hidden", "app.tip.hidden"),
     ("app.sidebar.blend", "app.tip.blend"),
-    ("app.sidebar.unused", "app.tip.unused"),
     ("app.sidebar.splitter", "app.tip.splitter"),
-    ("app.sidebar.downgrader", "app.tip.downgrader"),
+    ("app.sidebar.converter", "app.tip.converter"),
     ("app.sidebar.unpacker", "app.tip.unpacker"),
-    ("app.sidebar.viewer", "app.tip.viewer"),
     ("app.sidebar.static_export", "app.tip.static_export"),
+    ("app.sidebar.viewer", "app.tip.viewer"),
 ]
 
 
@@ -114,20 +112,6 @@ class SpineSwissKnifeApp(QMainWindow):
 
         sidebar_layout.addStretch()
 
-        # Switch Mode button
-        self._switch_mode_btn = QPushButton(tr("app.switch_mode"))
-        self._switch_mode_btn.setCursor(Qt.PointingHandCursor)
-        self._switch_mode_btn.clicked.connect(self._switch_mode)
-        sidebar_layout.addWidget(self._switch_mode_btn)
-
-        # Language switcher (bottom of sidebar)
-        self._lang_combo = QComboBox()
-        self._lang_combo.setFixedWidth(130)
-        self._lang_combo.addItem("English", "en")
-        self._lang_combo.addItem("Slovenčina", "sk")
-        self._lang_combo.setCurrentIndex(0)
-        self._lang_combo.currentIndexChanged.connect(self._on_language_changed)
-        sidebar_layout.addWidget(self._lang_combo)
         root_layout.addWidget(sidebar)
 
         # ── Main stacked area ──
@@ -272,12 +256,11 @@ class SpineSwissKnifeApp(QMainWindow):
             DeadBonesTab(self._tabs, self._get_config, on_modified=notify),
             HiddenAttachmentsTab(self._tabs, self._get_config, on_modified=notify),
             BlendSwitcherTab(self._tabs, self._get_config, on_modified=notify),
-            UnusedFinderTab(self._tabs, self._get_config),
             SplitterTab(self._tabs, self._get_config),
             SpineDowngraderTab(self._tabs, self._get_config),
             TextureUnpackerTab(self._tabs, self._get_config),
-            SpineViewerTab(self._tabs, self._get_config),
             StaticExporterTab(self._tabs, self._get_config),
+            SpineViewerTab(self._tabs, self._get_config),
         ]
 
         # Select first tool
@@ -383,8 +366,8 @@ class SpineSwissKnifeApp(QMainWindow):
         self._stack.setCurrentIndex(1)
         self._run_all_tabs()
 
-    def _enter_json_mode(self):
-        """Switch to tool area in JSON mode — existing behavior."""
+    def _enter_json_mode(self, json_path: str = ""):
+        """Switch to tool area in JSON mode with optional pre-selected JSON."""
         self._mode = "json"
         self._spine_project_path = ""
         self._export_dir = ""
@@ -408,6 +391,11 @@ class SpineSwissKnifeApp(QMainWindow):
 
         self._sidebar.show()
         self._stack.setCurrentIndex(1)
+
+        if json_path:
+            self._json_edit.setText(json_path)
+            self._auto_fill_from_json(json_path)
+            self._run_all_tabs()
 
     def _switch_mode(self):
         """Return to welcome page, clearing current state."""
@@ -555,19 +543,12 @@ class SpineSwissKnifeApp(QMainWindow):
 
     # ── Language ──
 
-    def _on_language_changed(self, index):
-        lang = self._lang_combo.itemData(index)
-        if lang:
-            set_language(lang)
-            settings.set_language(lang)
-
     def _retranslate(self):
         self.setWindowTitle(f"GreentubeSK Spine Swiss Knife v{__version__}")
         self._update_btn.setText(tr("update.btn"))
         self._loading_overlay.setText(tr("app.loading"))
         self._title_label.setText(tr("app.title"))
         self._home_btn.setText(tr("app.home"))
-        self._switch_mode_btn.setText(tr("app.switch_mode"))
         self._spine_project_label.setText(tr("app.spine_project_label"))
         self._btn_reimport.setText(tr("spine_mode.reimport_btn"))
         self._btn_reexport.setText(tr("spine_mode.reexport_btn"))
@@ -673,7 +654,6 @@ class SpineSwissKnifeApp(QMainWindow):
     def _run_all_tabs_inner(self):
         tabs = self._tab_instances
         has_atlas = bool(self._atlas_edit.text().strip())
-        has_images = bool(self._images_edit.text().strip())
 
         # JSON-only tabs: Analyzer, Rect Masks, Polygon, Keyframes, Dead Bones, Hidden Att., Blend
         for tab in [tabs[0], tabs[2], tabs[3], tabs[4], tabs[5], tabs[6], tabs[7]]:
@@ -681,20 +661,14 @@ class SpineSwissKnifeApp(QMainWindow):
                 tab._analyze()
             except Exception:
                 pass
-        # Unused — needs atlas + images
-        if has_atlas and has_images:
-            try:
-                tabs[8]._analyze()
-            except Exception:
-                pass
         # Splitter — Load Animations
         try:
-            tabs[9]._load()
+            tabs[8]._load()
         except Exception:
             pass
-        # Downgrader — Detect Version
+        # Static Exporter — reads animation list from JSON
         try:
-            tabs[10]._detect()
+            tabs[11]._load()
         except Exception:
             pass
         # Viewer — needs atlas
@@ -703,11 +677,6 @@ class SpineSwissKnifeApp(QMainWindow):
                 tabs[12]._load()
             except Exception:
                 pass
-        # Static Exporter — reads animation list from JSON
-        try:
-            tabs[13]._load()
-        except Exception:
-            pass
 
     # --- Auto-update ---
 

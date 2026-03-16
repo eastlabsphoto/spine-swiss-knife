@@ -15,7 +15,7 @@ from .spine_cli import detect_spine_executable
 
 class WelcomePage(QWidget):
     spine_mode_selected = Signal(str, bool, str)  # (.spine path, pack_atlas, version)
-    json_mode_selected = Signal()
+    json_mode_selected = Signal(str)  # (json path)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -54,7 +54,35 @@ class WelcomePage(QWidget):
         self._subtitle.setAlignment(Qt.AlignCenter)
         cl.addWidget(self._subtitle)
 
-        # Spine path group
+        # Buttons row
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(16)
+        btn_row.addStretch()
+
+        self._btn_spine = QPushButton(tr("welcome.btn_spine"))
+        self._btn_spine.setProperty("role", "welcome-primary")
+        self._btn_spine.setCursor(Qt.PointingHandCursor)
+        self._btn_spine.setEnabled(False)
+        self._btn_spine.clicked.connect(self._on_spine_clicked)
+        btn_row.addWidget(self._btn_spine)
+
+        self._btn_json = QPushButton(tr("welcome.btn_json"))
+        self._btn_json.setProperty("role", "welcome-secondary")
+        self._btn_json.setCursor(Qt.PointingHandCursor)
+        self._btn_json.clicked.connect(self._on_json_clicked)
+        btn_row.addWidget(self._btn_json)
+
+        btn_row.addStretch()
+        cl.addLayout(btn_row)
+
+        # Info text (below buttons)
+        self._info = QLabel(tr("welcome.info_spine"))
+        self._info.setProperty("role", "info")
+        self._info.setAlignment(Qt.AlignCenter)
+        self._info.setWordWrap(True)
+        cl.addWidget(self._info)
+
+        # Spine path group (below actions)
         self._path_group = QGroupBox(tr("welcome.spine_path_group"))
         pg_layout = QVBoxLayout(self._path_group)
 
@@ -79,34 +107,6 @@ class WelcomePage(QWidget):
         pg_layout.addWidget(self._status_label)
 
         cl.addWidget(self._path_group)
-
-        # Buttons row
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(16)
-        btn_row.addStretch()
-
-        self._btn_spine = QPushButton(tr("welcome.btn_spine"))
-        self._btn_spine.setProperty("role", "welcome-primary")
-        self._btn_spine.setCursor(Qt.PointingHandCursor)
-        self._btn_spine.setEnabled(False)
-        self._btn_spine.clicked.connect(self._on_spine_clicked)
-        btn_row.addWidget(self._btn_spine)
-
-        self._btn_json = QPushButton(tr("welcome.btn_json"))
-        self._btn_json.setProperty("role", "welcome-secondary")
-        self._btn_json.setCursor(Qt.PointingHandCursor)
-        self._btn_json.clicked.connect(self.json_mode_selected.emit)
-        btn_row.addWidget(self._btn_json)
-
-        btn_row.addStretch()
-        cl.addLayout(btn_row)
-
-        # Info text
-        self._info = QLabel(tr("welcome.info_spine"))
-        self._info.setProperty("role", "info")
-        self._info.setAlignment(Qt.AlignCenter)
-        self._info.setWordWrap(True)
-        cl.addWidget(self._info)
 
         # Center container horizontally
         h = QHBoxLayout()
@@ -157,6 +157,14 @@ class WelcomePage(QWidget):
             self._set_status("error", tr("welcome.spine_not_found"))
 
     # -- Mode selection --
+
+    def _on_json_clicked(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, tr("app.dialog.select_json"), "",
+            tr("app.filter.json"),
+        )
+        if path:
+            self.json_mode_selected.emit(path)
 
     def _on_spine_clicked(self):
         path, _ = QFileDialog.getOpenFileName(

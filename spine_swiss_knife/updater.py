@@ -167,7 +167,11 @@ def _update_frozen(extracted_root: Path) -> None:
         app_bundle = Path(sys.executable).parent.parent.parent
         new_app = extracted_root / "SpineSwissKnife.app"
         if not new_app.is_dir():
-            raise RuntimeError("SpineSwissKnife.app not found in archive")
+            # ZIP root IS the .app bundle (no wrapper folder)
+            if (extracted_root / "Contents").is_dir():
+                new_app = extracted_root
+            else:
+                raise RuntimeError("SpineSwissKnife.app not found in archive")
 
         # Replace Contents/ (skip MacOS/SpineSwissKnife binary — it's running)
         new_contents = new_app / "Contents"
@@ -188,7 +192,11 @@ def _update_frozen(extracted_root: Path) -> None:
         app_dir = Path(sys.executable).parent
         new_dir = extracted_root / "SpineSwissKnife"
         if not new_dir.is_dir():
-            raise RuntimeError("SpineSwissKnife/ not found in archive")
+            # ZIP root IS the app folder (no wrapper folder)
+            if (extracted_root / "SpineSwissKnife.exe").is_file():
+                new_dir = extracted_root
+            else:
+                raise RuntimeError("SpineSwissKnife/ not found in archive")
 
         # Write a batch script that replaces files after we exit
         bat_path = Path(tempfile.gettempdir()) / "ssk_update.bat"

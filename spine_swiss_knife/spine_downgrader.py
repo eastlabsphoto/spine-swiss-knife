@@ -1,17 +1,31 @@
-"""Spine Downgrader tab — downgrade Spine JSON versions: 4.x -> 3.8 -> 3.7 -> 3.6."""
+"""Spine Version Converter tab — convert Spine files between versions via CLI.
 
+Also retains the original JSON-level downgrade helpers (``convert_to_38``,
+``convert_to_37``, etc.) used by ``app.py._import_back_to_spine``.
+"""
+
+import json as _json
 import os
 import re
 import shutil
+import tempfile
+
+from pathlib import Path
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QComboBox,
-    QTabWidget, QTextEdit, QMessageBox,
+    QTabWidget, QTextEdit, QMessageBox, QTreeWidget, QTreeWidgetItem,
+    QFileDialog, QHeaderView, QAbstractItemView,
 )
 from PySide6.QtGui import QTextCharFormat, QColor, QFont, QTextCursor
+from PySide6.QtCore import Qt
 
 from .i18n import tr, language_changed
 from .spine_json import load_spine_json
+from .spine_cli import (
+    read_spine_file_version, export_spine_project, import_to_spine_project,
+)
+from .settings import settings
 
 
 # ==========================================================================
@@ -249,54 +263,113 @@ def convert_to_destination(data: dict, dest: str) -> tuple[dict, list[str]]:
 # UI Tab
 # ==========================================================================
 
-class SpineDowngraderTab:
-    DEST_VERSIONS = ["3.8.99", "3.7.94", "3.6.53"]
+class SpineVersionConverterTab:
+    """Bulk version converter — upgrade or downgrade .spine / .json files via CLI."""
+
+    DEST_VERSIONS = ["4.2.18", "4.1.24", "4.0.64", "3.8.99", "3.7.94", "3.6.53"]
 
     def __init__(self, tabs: QTabWidget, get_config):
         self._get_config = get_config
         self._tabs = tabs
+        self._files: list[dict] = []  # {path, type, version, item}
 
         self._page = QWidget()
-        tabs.addTab(self._page, tr("downgrader.tab"))
+        tabs.addTab(self._page, tr("converter.tab"))
         layout = QVBoxLayout(self._page)
         layout.setContentsMargins(5, 5, 5, 5)
 
-        self._info = QLabel(tr("downgrader.info"))
+        # Info label
+        self._info = QLabel(tr("converter.info"))
         self._info.setWordWrap(True)
         layout.addWidget(self._info)
 
-        btn_row = QHBoxLayout()
-        self._target_label = QLabel(tr("downgrader.target_label"))
-        btn_row.addWidget(self._target_label)
-        self._dest_combo = QComboBox()
-        self._dest_combo.addItems(self.DEST_VERSIONS)
-        self._dest_combo.setCurrentText("3.7.94")
-        btn_row.addWidget(self._dest_combo)
-        self._convert_btn = QPushButton(tr("downgrader.convert_btn"))
-        self._convert_btn.clicked.connect(self._convert)
-        btn_row.addWidget(self._convert_btn)
-        btn_row.addStretch()
-        layout.addLayout(btn_row)
+        # Toolbar row
+        toolbar = QHBoxLayout()
+        self._btn_add = QPushButton(tr("converter.add_files"))
+        self._btn_add.setCursor(Qt.PointingHandCursor)
+        self._btn_add.clicked.connect(self._add_files)
+        toolbar.addWidget(self._btn_add)
+        self._btn_remove = QPushButton(tr("converter.remove_selected"))
+        self._btn_remove.setCursor(Qt.PointingHandCursor)
+        self._btn_remove.clicked.connect(self._remove_selected)
+        toolbar.addWidget(self._btn_remove)
+        self._btn_clear = QPushButton(tr("converter.clear_all"))
+        self._btn_clear.setCursor(Qt.PointingHandCursor)
+        self._btn_clear.clicked.connect(self._clear_all)
+        toolbar.addWidget(self._btn_clear)
+        toolbar.addStretch()
+        layout.addLayout(toolbar)
 
-        self._stats = QLabel(tr("downgrader.default_stats"))
+        # File list
+        self._tree = QTreeWidget()
+        self._tree.setHeaderLabels([
+            tr("converter.col.filename"),
+            tr("converter.col.type"),
+            tr("converter.col.version"),
+            tr("converter.col.status"),
+        ])
+        self._tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self._tree.setRootIsDecorated(False)
+        self._tree.setAlternatingRowColors(True)
+        header = self._tree.header()
+        header.setStretchLastSection(True)
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        layout.addWidget(self._tree, 1)
+
+        # Bottom row: target version + convert button
+        bottom = QHBoxLayout()
+        self._target_label = QLabel(tr("converter.target_label"))
+        bottom.addWidget(self._target_label)
+        self._dest_combo = QComboBox()
+        self._dest_combo.setEditable(True)
+        self._dest_combo.addItems(self.DEST_VERSIONS)
+        self._dest_combo.setCurrentText("3.8.99")
+        bottom.addWidget(self._dest_combo)
+        bottom.addStretch()
+        self._convert_btn = QPushButton(tr("converter.convert_btn"))
+        self._convert_btn.setProperty("role", "primary")
+        self._convert_btn.setCursor(Qt.PointingHandCursor)
+        self._convert_btn.clicked.connect(self._convert_all)
+        bottom.addWidget(self._convert_btn)
+        layout.addLayout(bottom)
+
+        # Stats
+        self._stats = QLabel(tr("converter.default_stats"))
         self._stats.setStyleSheet("font-weight: bold; color: #6ec072;")
         layout.addWidget(self._stats)
 
+        # Log area
         self._log = QTextEdit()
         self._log.setReadOnly(True)
         self._log.setFont(QFont("monospace", 10))
-        layout.addWidget(self._log, 1)
+        self._log.setMaximumHeight(140)
+        layout.addWidget(self._log)
 
         language_changed.connect(self._retranslate)
+
+    # ── i18n ──
 
     def _retranslate(self):
         idx = self._tabs.indexOf(self._page)
         if idx >= 0:
-            self._tabs.setTabText(idx, tr("downgrader.tab"))
-        self._info.setText(tr("downgrader.info"))
-        self._target_label.setText(tr("downgrader.target_label"))
-        self._convert_btn.setText(tr("downgrader.convert_btn"))
-        self._stats.setText(tr("downgrader.default_stats"))
+            self._tabs.setTabText(idx, tr("converter.tab"))
+        self._info.setText(tr("converter.info"))
+        self._btn_add.setText(tr("converter.add_files"))
+        self._btn_remove.setText(tr("converter.remove_selected"))
+        self._btn_clear.setText(tr("converter.clear_all"))
+        self._tree.setHeaderLabels([
+            tr("converter.col.filename"),
+            tr("converter.col.type"),
+            tr("converter.col.version"),
+            tr("converter.col.status"),
+        ])
+        self._target_label.setText(tr("converter.target_label"))
+        self._convert_btn.setText(tr("converter.convert_btn"))
+        self._stats.setText(tr("converter.default_stats"))
+
+    # ── Log helpers ──
 
     def _append(self, text: str, color: str = "#cdd6f4", bold: bool = False):
         fmt = QTextCharFormat()
@@ -312,104 +385,169 @@ class SpineDowngraderTab:
     def _clear_log(self):
         self._log.clear()
 
-    def _detect(self):
-        json_path = self._get_config("json")
-        if not json_path or not os.path.isfile(json_path):
-            QMessageBox.critical(None, tr("err.title"), tr("err.no_json"))
-            return
-        try:
-            data = load_spine_json(json_path)
-        except Exception as e:
-            QMessageBox.critical(None, tr("err.title"), tr("err.parse_json", error=e))
-            return
+    # ── File management ──
 
-        version = _read_source_version(data)
-        norm = _normalize_version(version) if version else "unknown"
-
-        self._clear_log()
-        self._append(tr("downgrader.log.file", name=os.path.basename(json_path)))
-        self._append(tr("downgrader.log.detected", version=version or tr("downgrader.log.not_found")))
-        self._append(tr("downgrader.log.family", family=norm))
-
-        if norm == "4.x":
-            self._append(tr("downgrader.log.targets_38"))
-        elif norm == "3.8":
-            self._append(tr("downgrader.log.targets_37"))
-        elif norm == "3.7":
-            self._append(tr("downgrader.log.targets_36"))
-        elif norm == "3.6":
-            self._append(tr("downgrader.log.already_36"), "#f9e2af")
-        else:
-            self._append(tr("downgrader.log.unknown"), "#f9e2af")
-
-        self._stats.setText(tr("downgrader.stats.detected", version=version or 'unknown', family=norm))
-
-    def _convert(self):
-        json_path = self._get_config("json")
-        if not json_path or not os.path.isfile(json_path):
-            QMessageBox.critical(None, tr("err.title"), tr("err.no_json"))
-            return
-        dest = self._dest_combo.currentText()
-        if not dest:
-            QMessageBox.critical(None, tr("err.title"), tr("downgrader.err.no_target"))
-            return
-        try:
-            data = load_spine_json(json_path)
-        except Exception as e:
-            QMessageBox.critical(None, tr("err.title"), tr("err.parse_json", error=e))
-            return
-
-        src_version = _read_source_version(data)
-        src_norm = _normalize_version(src_version)
-        dest_norm = _normalize_version(dest)
-
-        self._clear_log()
-        self._append(tr("downgrader.log.source", name=os.path.basename(json_path)))
-        self._append(tr("downgrader.log.source_version", version=src_version or 'unknown', family=src_norm))
-        self._append(tr("downgrader.log.target_version", version=dest))
-        self._append("")
-
-        if _RANK.get(src_norm, 99) < _RANK.get(dest_norm, 1) and src_norm != "unknown":
-            self._append(tr("downgrader.log.cannot_upgrade", src=src_version, dest=dest), "#f38ba8", bold=True)
-            self._stats.setText(tr("downgrader.stats.error"))
-            return
-
-        if QMessageBox.question(None, tr("confirm.title"),
-            tr("downgrader.confirm", src=src_version or 'unknown', dest=dest, backup=json_path + ".backup")) != QMessageBox.Yes:
-            return
-
-        try:
-            shutil.copy2(json_path, json_path + ".backup")
-            self._append(tr("downgrader.log.backup_created"))
-        except Exception as e:
-            QMessageBox.critical(None, tr("err.title"), tr("downgrader.err.backup_failed", error=e))
-            return
-
-        try:
-            converted, warnings = convert_to_destination(data, dest)
-        except Exception as e:
-            self._append(tr("downgrader.log.conversion_failed", error=e), "#f38ba8", bold=True)
-            self._stats.setText(tr("downgrader.stats.failed"))
-            return
-
-        for w in warnings:
-            self._append(tr("downgrader.log.warning", msg=w), "#f9e2af")
-
-        stem = os.path.splitext(os.path.basename(json_path))[0]
-        out_dir = os.path.dirname(json_path)
-        out_path = os.path.join(out_dir, f"{stem}_{dest}.json")
-
-        try:
-            from .splitter import _save_spine_format
-            _save_spine_format(out_path, converted)
-        except Exception as e:
-            self._append(tr("downgrader.log.save_failed", error=e), "#f38ba8", bold=True)
-            self._stats.setText(tr("downgrader.stats.save_failed"))
-            return
-
-        self._append("")
-        self._append(tr("downgrader.log.saved", path=out_path), "#a6e3a1", bold=True)
-        self._append(tr("downgrader.log.original_backed", path=json_path + ".backup"))
-        self._stats.setText(
-            tr("downgrader.stats.done", version=dest, filename=os.path.basename(out_path))
+    def _add_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            None, tr("converter.dialog.add_files"), "",
+            tr("converter.filter"),
         )
+        if not paths:
+            return
+        for p in paths:
+            # Skip duplicates
+            if any(f["path"] == p for f in self._files):
+                continue
+            ext = Path(p).suffix.lower()
+            ftype = ".spine" if ext == ".spine" else ".json"
+            version = self._detect_version(p, ftype)
+            item = QTreeWidgetItem([
+                Path(p).name, ftype, version or "?", tr("converter.status.ready"),
+            ])
+            self._tree.addTopLevelItem(item)
+            self._files.append({"path": p, "type": ftype, "version": version, "item": item})
+
+    def _detect_version(self, path: str, ftype: str) -> str:
+        if ftype == ".spine":
+            return read_spine_file_version(path)
+        # .json — read skeleton.spine
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+            return str(data.get("skeleton", {}).get("spine", ""))
+        except Exception:
+            return ""
+
+    def _remove_selected(self):
+        selected = self._tree.selectedItems()
+        if not selected:
+            return
+        for item in selected:
+            idx = self._tree.indexOfTopLevelItem(item)
+            if idx >= 0:
+                self._tree.takeTopLevelItem(idx)
+                self._files = [f for f in self._files if f["item"] is not item]
+
+    def _clear_all(self):
+        self._tree.clear()
+        self._files.clear()
+
+    # ── No-op stub (called by _run_all_tabs_inner) ──
+
+    def _detect(self):
+        pass
+
+    # ── Conversion ──
+
+    def _convert_all(self):
+        if not self._files:
+            QMessageBox.information(None, tr("info.title"), tr("converter.no_files"))
+            return
+
+        target = self._dest_combo.currentText().strip()
+        if not target:
+            QMessageBox.critical(None, tr("err.title"), tr("converter.err.no_target"))
+            return
+
+        exe = self._get_config("spine_exe")
+        if not exe:
+            QMessageBox.critical(None, tr("err.title"), tr("converter.err.no_exe"))
+            return
+
+        self._clear_log()
+        self._append(tr("converter.log.start", target=target), bold=True)
+
+        ok_count = 0
+        fail_count = 0
+        from PySide6.QtWidgets import QApplication
+
+        for entry in self._files:
+            path = entry["path"]
+            ftype = entry["type"]
+            item = entry["item"]
+            name = Path(path).name
+
+            item.setText(3, tr("converter.status.converting"))
+            QApplication.processEvents()
+
+            try:
+                if ftype == ".spine":
+                    out = self._convert_spine_file(exe, path, target)
+                else:
+                    out = self._convert_json_file(exe, path, target)
+                item.setText(3, tr("converter.status.done"))
+                self._append(tr("converter.log.ok", name=name, output=Path(out).name), "#a6e3a1")
+                ok_count += 1
+            except Exception as e:
+                item.setText(3, tr("converter.status.failed"))
+                self._append(tr("converter.log.fail", name=name, error=str(e)), "#f38ba8")
+                fail_count += 1
+
+        self._stats.setText(tr("converter.stats.done", ok=ok_count, fail=fail_count, total=len(self._files)))
+        self._append("")
+        self._append(tr("converter.log.finished", ok=ok_count, fail=fail_count), "#a6e3a1", bold=True)
+
+    def _convert_spine_file(self, exe: str, path: str, target: str) -> str:
+        """Convert .spine → .spine at target version.
+
+        Flow: export to JSON in tmp → import at target version → output file.
+        """
+        tmp_dir = tempfile.mkdtemp(prefix="ssk_conv_")
+        try:
+            # Step 1: export .spine → JSON
+            result = export_spine_project(exe, path, tmp_dir, pack=False)
+            if not result.success:
+                raise RuntimeError(result.stderr or "Export failed")
+
+            json_path = result.output_json
+            if not json_path:
+                raise RuntimeError("Export produced no JSON")
+
+            # Step 2: import JSON → new .spine at target version
+            stem = Path(path).stem
+            out_path = str(Path(path).parent / f"{stem}_{target}.spine")
+            result2 = import_to_spine_project(
+                exe, json_path, out_path, target_version=target,
+            )
+            if not result2.success:
+                raise RuntimeError(result2.stderr or "Import failed")
+
+            return out_path
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def _convert_json_file(self, exe: str, path: str, target: str) -> str:
+        """Convert .json → .json at target version.
+
+        Flow: import to temp .spine at target → export back to JSON.
+        """
+        tmp_dir = tempfile.mkdtemp(prefix="ssk_conv_")
+        try:
+            # Step 1: import JSON → temp .spine at target version
+            tmp_spine = str(Path(tmp_dir) / "temp.spine")
+            result = import_to_spine_project(
+                exe, path, tmp_spine, target_version=target,
+            )
+            if not result.success:
+                raise RuntimeError(result.stderr or "Import failed")
+
+            # Step 2: export temp .spine → JSON
+            export_dir = str(Path(tmp_dir) / "export")
+            result2 = export_spine_project(exe, tmp_spine, export_dir, pack=False)
+            if not result2.success:
+                raise RuntimeError(result2.stderr or "Export failed")
+
+            if not result2.output_json:
+                raise RuntimeError("Export produced no JSON")
+
+            # Step 3: copy to output
+            stem = Path(path).stem
+            out_path = str(Path(path).parent / f"{stem}_{target}.json")
+            shutil.copy2(result2.output_json, out_path)
+            return out_path
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# Backward-compatible alias — keeps existing imports in app.py working
+SpineDowngraderTab = SpineVersionConverterTab

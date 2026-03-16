@@ -5,7 +5,7 @@ import shutil
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
     QTabWidget, QTreeWidget, QTreeWidgetItem, QHeaderView, QMessageBox,
 )
 
@@ -59,6 +59,11 @@ class BlendSwitcherTab:
         self._switch_btn.setEnabled(False)
         self._switch_btn.clicked.connect(self._switch)
         btn_row.addWidget(self._switch_btn)
+        self._target_label = QLabel(tr("blend.target_label"))
+        btn_row.addWidget(self._target_label)
+        self._target_combo = QComboBox()
+        self._target_combo.addItems(["additive", "normal"])
+        btn_row.addWidget(self._target_combo)
         self._btn_select_all = QPushButton(tr("blend.select_all"))
         self._btn_unselect_all = QPushButton(tr("blend.unselect_all"))
         self._btn_select_all.clicked.connect(self._select_all)
@@ -94,6 +99,7 @@ class BlendSwitcherTab:
         self._info.setText(tr("blend.info"))
         self._stats.setText(tr("blend.default_stats"))
         self._switch_btn.setText(tr("blend.switch_btn"))
+        self._target_label.setText(tr("blend.target_label"))
         self._btn_select_all.setText(tr("blend.select_all"))
         self._btn_unselect_all.setText(tr("blend.unselect_all"))
         self._tree.setHeaderLabels([
@@ -160,9 +166,11 @@ class BlendSwitcherTab:
             return
 
         backup_path = json_path + ".backup"
+        target_blend = self._target_combo.currentText()
+
         if QMessageBox.question(
             None, tr("confirm.title"),
-            tr("blend.confirm", count=len(checked_names), backup=backup_path),
+            tr("blend.confirm", count=len(checked_names), target=target_blend, backup=backup_path),
         ) != QMessageBox.Yes:
             return
 
@@ -177,7 +185,10 @@ class BlendSwitcherTab:
         switched = 0
         for slot in spine_data.get("slots", []):
             if slot.get("name") in switch_set and slot.get("blend") in ("multiply", "screen"):
-                slot["blend"] = "additive"
+                if target_blend == "normal":
+                    del slot["blend"]  # normal is default, no key needed
+                else:
+                    slot["blend"] = target_blend
                 switched += 1
 
         try:
@@ -188,7 +199,7 @@ class BlendSwitcherTab:
 
         QMessageBox.information(
             None, tr("done.title"),
-            tr("blend.done", count=switched, backup=backup_path))
+            tr("blend.done", count=switched, target=target_blend, backup=backup_path))
         if self._on_modified:
             self._on_modified()
         else:

@@ -512,17 +512,26 @@ def import_to_spine_project(
     exe: str, json_path: str, spine_file: str,
     timeout: int = 600,
     on_output: Optional[Callable[[str], None]] = None,
+    *, target_version: Optional[str] = None,
 ) -> SpineCliResult:
-    """Import modified JSON back into .spine project."""
+    """Import modified JSON back into .spine project.
+
+    When *target_version* is given it is used directly for the ``-u`` flag,
+    bypassing automatic version detection.  This allows callers to force a
+    specific Spine editor version (upgrade or downgrade).
+    """
     cmd = [exe]
-    # Determine version: prefer existing .spine, fall back to JSON input
-    version = read_spine_file_version(spine_file)
-    if not version:
-        try:
-            with open(json_path, "r", encoding="utf-8") as f:
-                version = _json.load(f).get("skeleton", {}).get("spine", "")
-        except Exception:
-            pass
+    if target_version:
+        version = target_version
+    else:
+        # Determine version: prefer existing .spine, fall back to JSON input
+        version = read_spine_file_version(spine_file)
+        if not version:
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    version = _json.load(f).get("skeleton", {}).get("spine", "")
+            except Exception:
+                pass
     if version:
         cmd += ["-u", version]
     cmd += ["-i", json_path, "-o", spine_file, "-r"]
