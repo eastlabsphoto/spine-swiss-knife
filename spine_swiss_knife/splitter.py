@@ -171,6 +171,41 @@ def compute_dependencies(spine_data: dict, anim_names: list[str]) -> dict:
         if slot["bone"] in bones_needed:
             slots_needed.add(slot["name"])
 
+    # Clipping attachments reference an "end" slot — pull those in too,
+    # along with all slots between the clip slot and end slot (draw order).
+    slot_order = [s["name"] for s in slots_list]
+    changed = True
+    while changed:
+        changed = False
+        for skin_name, skin_data in skins.items():
+            for slot_name, slot_atts in skin_data.items():
+                if slot_name not in slots_needed:
+                    continue
+                for att_name, att_data in slot_atts.items():
+                    if att_data.get("type") != "clipping":
+                        continue
+                    end_slot = att_data.get("end")
+                    if not end_slot or end_slot in slots_needed:
+                        continue
+                    # Add end slot and all slots in between
+                    if slot_name in slot_order and end_slot in slot_order:
+                        clip_idx = slot_order.index(slot_name)
+                        end_idx = slot_order.index(end_slot)
+                        for idx in range(clip_idx, end_idx + 1):
+                            s = slot_order[idx]
+                            if s not in slots_needed:
+                                slots_needed.add(s)
+                                bone = slot_bone_map.get(s)
+                                if bone:
+                                    bones_needed |= _ancestors(bone, parent_map)
+                                changed = True
+                    else:
+                        slots_needed.add(end_slot)
+                        bone = slot_bone_map.get(end_slot)
+                        if bone:
+                            bones_needed |= _ancestors(bone, parent_map)
+                        changed = True
+
     attachments_needed = {}
     for slot_name in slots_needed:
         atts = set()

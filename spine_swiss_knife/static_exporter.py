@@ -106,8 +106,17 @@ def _normalize_canvas(
     shape: str,
     padding: int,
     center_pivot: bool,
+    fixed_size: tuple[int, int] | None = None,
 ) -> dict[str, str]:
     """Normalize all exported images to uniform canvas size.
+
+    When *fixed_size* ``(w, h)`` is given the output canvas is exactly that
+    size with the Spine origin mapped to its centre.  Content that overflows
+    is cropped; smaller content gets transparent padding.
+
+    When *center_pivot* is True the Spine origin (centre of the exported
+    image) is kept at the centre of the output canvas so that pivots are
+    preserved.  Otherwise content is trimmed and top-left aligned.
 
     Overwrites files in place.  Returns the same dict.
     """
@@ -125,30 +134,67 @@ def _normalize_canvas(
     if not bboxes:
         return image_paths
 
-    max_cw = max((b[2] - b[0]) for b in bboxes.values())
-    max_ch = max((b[3] - b[1]) for b in bboxes.values())
+    if fixed_size:
+        # User-defined canvas — origin stays at centre.
+        target_w, target_h = fixed_size
+        for name, img in images.items():
+            ox = img.width / 2.0
+            oy = img.height / 2.0
+            canvas = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
+            paste_x = int(target_w / 2.0 - ox)
+            paste_y = int(target_h / 2.0 - oy)
+            canvas.paste(img, (paste_x, paste_y))
+            canvas.save(image_paths[name])
+    elif center_pivot:
+        # Keep Spine origin (center of source image) at canvas center.
+        max_left = max_right = max_top = max_bottom = 0
+        for name, img in images.items():
+            bbox = bboxes[name]
+            ox = img.width / 2.0
+            oy = img.height / 2.0
+            max_left = max(max_left, ox - bbox[0])
+            max_right = max(max_right, bbox[2] - ox)
+            max_top = max(max_top, oy - bbox[1])
+            max_bottom = max(max_bottom, bbox[3] - oy)
 
-    if shape == "square":
-        side = max(max_cw, max_ch) + 2 * padding
-        target_w, target_h = side, side
+        half_w = max(max_left, max_right) + padding
+        half_h = max(max_top, max_bottom) + padding
+
+        if shape == "square":
+            half = max(half_w, half_h)
+            half_w = half_h = half
+
+        target_w = int(2 * half_w)
+        target_h = int(2 * half_h)
+
+        for name, img in images.items():
+            bbox = bboxes[name]
+            ox = img.width / 2.0
+            oy = img.height / 2.0
+            content = img.crop(bbox)
+            canvas = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
+            paste_x = int(target_w / 2.0 + (bbox[0] - ox))
+            paste_y = int(target_h / 2.0 + (bbox[1] - oy))
+            canvas.paste(content, (paste_x, paste_y))
+            canvas.save(image_paths[name])
     else:
-        target_w = max_cw + 2 * padding
-        target_h = max_ch + 2 * padding
+        # Trim to content, uniform size, top-left aligned.
+        max_cw = max((b[2] - b[0]) for b in bboxes.values())
+        max_ch = max((b[3] - b[1]) for b in bboxes.values())
 
-    for name, img in images.items():
-        bbox = bboxes[name]
-        content = img.crop(bbox)
-        cw, ch = content.size
-
-        canvas = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
-        if center_pivot:
-            x = (target_w - cw) // 2
-            y = (target_h - ch) // 2
+        if shape == "square":
+            side = max(max_cw, max_ch) + 2 * padding
+            target_w, target_h = side, side
         else:
-            x = padding
-            y = padding
-        canvas.paste(content, (x, y))
-        canvas.save(image_paths[name])
+            target_w = max_cw + 2 * padding
+            target_h = max_ch + 2 * padding
+
+        for name, img in images.items():
+            bbox = bboxes[name]
+            content = img.crop(bbox)
+            canvas = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
+            canvas.paste(content, (padding, padding))
+            canvas.save(image_paths[name])
 
     return image_paths
 
@@ -157,8 +203,12 @@ def _create_blur_variants(
     image_paths: dict[str, str],
     radius: int,
     extra_pad: int,
+    blur_canvas_size: tuple[int, int] | None = None,
 ) -> dict[str, str]:
     """Create vertical motion blur variants for each image.
+
+    When *blur_canvas_size* ``(w, h)`` is given the blur output is placed
+    on a canvas of exactly that size, centred on the image centre.
 
     Returns dict mapping animation name -> blur PNG path.
     """
@@ -175,6 +225,16 @@ def _create_blur_variants(
             img = padded
 
         blurred = _vertical_motion_blur(img, radius)
+
+        # Resize to fixed blur canvas if requested
+        if blur_canvas_size:
+            bw, bh = blur_canvas_size
+            src_w, src_h = blurred.size
+            canvas = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
+            paste_x = (bw - src_w) // 2
+            paste_y = (bh - src_h) // 2
+            canvas.paste(blurred, (paste_x, paste_y))
+            blurred = canvas
 
         stem = Path(path).stem
         parent = Path(path).parent
@@ -423,6 +483,8 @@ class StaticExporterTab:
         self._shape_combo = QComboBox()
         self._shape_combo.addItem(tr("static.shape_square"), "square")
         self._shape_combo.addItem(tr("static.shape_original"), "original")
+        self._shape_combo.addItem(tr("static.shape_custom"), "custom")
+        self._shape_combo.currentIndexChanged.connect(self._on_shape_changed)
         canvas_row.addWidget(self._shape_combo)
         canvas_row.addSpacing(10)
         self._pad_label = QLabel(tr("static.padding_label"))
@@ -438,6 +500,55 @@ class StaticExporterTab:
         canvas_row.addWidget(self._center_cb)
         canvas_row.addStretch()
         layout.addLayout(canvas_row)
+
+        # --- Custom canvas size row (hidden by default) ---
+        custom_row = QHBoxLayout()
+        custom_row.setSpacing(6)
+        self._static_size_label = QLabel(tr("static.custom_static_label"))
+        custom_row.addWidget(self._static_size_label)
+        self._static_w = QSpinBox()
+        self._static_w.setRange(1, 10000)
+        self._static_w.setValue(400)
+        self._static_w.setFixedWidth(70)
+        custom_row.addWidget(self._static_w)
+        self._static_x_label = QLabel("x")
+        custom_row.addWidget(self._static_x_label)
+        self._static_h = QSpinBox()
+        self._static_h.setRange(1, 10000)
+        self._static_h.setValue(400)
+        self._static_h.setFixedWidth(70)
+        custom_row.addWidget(self._static_h)
+        self._static_px_label = QLabel("px")
+        custom_row.addWidget(self._static_px_label)
+        custom_row.addSpacing(16)
+        self._blur_size_label = QLabel(tr("static.custom_blur_label"))
+        custom_row.addWidget(self._blur_size_label)
+        self._blur_w = QSpinBox()
+        self._blur_w.setRange(1, 10000)
+        self._blur_w.setValue(450)
+        self._blur_w.setFixedWidth(70)
+        custom_row.addWidget(self._blur_w)
+        self._blur_x_label = QLabel("x")
+        custom_row.addWidget(self._blur_x_label)
+        self._blur_h = QSpinBox()
+        self._blur_h.setRange(1, 10000)
+        self._blur_h.setValue(450)
+        self._blur_h.setFixedWidth(70)
+        custom_row.addWidget(self._blur_h)
+        self._blur_px_label = QLabel("px")
+        custom_row.addWidget(self._blur_px_label)
+        custom_row.addStretch()
+        layout.addLayout(custom_row)
+
+        # Collect custom-row widgets for show/hide
+        self._custom_widgets = [
+            self._static_size_label, self._static_w, self._static_x_label,
+            self._static_h, self._static_px_label,
+            self._blur_size_label, self._blur_w, self._blur_x_label,
+            self._blur_h, self._blur_px_label,
+        ]
+        for w in self._custom_widgets:
+            w.setVisible(False)
 
         # --- Compact blur row ---
         blur_row = QHBoxLayout()
@@ -522,8 +633,11 @@ class StaticExporterTab:
         self._shape_label.setText(tr("static.shape_label"))
         self._shape_combo.setItemText(0, tr("static.shape_square"))
         self._shape_combo.setItemText(1, tr("static.shape_original"))
+        self._shape_combo.setItemText(2, tr("static.shape_custom"))
         self._pad_label.setText(tr("static.padding_label"))
         self._center_cb.setText(tr("static.center_pivot"))
+        self._static_size_label.setText(tr("static.custom_static_label"))
+        self._blur_size_label.setText(tr("static.custom_blur_label"))
         self._blur_cb.setText(tr("static.blur_enable"))
         self._blur_radius_label.setText(tr("static.blur_radius_label"))
         self._blur_extra_label.setText(tr("static.blur_extra_label"))
@@ -533,6 +647,15 @@ class StaticExporterTab:
         self._stats.setText(tr("static.default_stats"))
 
     # --- UI Helpers ---
+
+    def _on_shape_changed(self, _index: int):
+        is_custom = self._shape_combo.currentData() == "custom"
+        for w in self._custom_widgets:
+            w.setVisible(is_custom)
+        # Hide auto-fit controls when custom is active
+        self._pad_label.setVisible(not is_custom)
+        self._pad_spin.setVisible(not is_custom)
+        self._center_cb.setVisible(not is_custom)
 
     def _on_blur_toggled(self, checked: bool):
         self._blur_slider.setEnabled(checked)
@@ -621,13 +744,23 @@ class StaticExporterTab:
         # Auto-set output dir
         mode = self._get_config("mode")
         spine_path = self._get_config("spine")
+        json_path = self._get_config("json")
+        exe = self._get_config("spine_exe")
+
         if mode == "spine" and spine_path:
             stem = Path(spine_path).stem
             out_dir = str(Path(spine_path).parent / f"_static_{stem}")
             self._output_edit.setText(out_dir)
+        elif mode == "json" and json_path:
+            stem = Path(json_path).stem
+            out_dir = str(Path(json_path).parent / f"_static_{stem}")
+            self._output_edit.setText(out_dir)
 
-        # Update info based on mode
-        if mode != "spine":
+        # Update info based on mode — allow JSON mode when Spine CLI is available
+        has_spine_cli = bool(exe)
+        can_export = (mode == "spine" and spine_path) or (mode == "json" and json_path and has_spine_cli)
+
+        if not can_export:
             self._info.setText(tr("static.info_no_spine"))
             self._export_btn.setEnabled(False)
         else:
@@ -646,12 +779,21 @@ class StaticExporterTab:
 
         mode = self._get_config("mode")
         spine_path = self._get_config("spine")
+        json_path = self._get_config("json")
         exe = self._get_config("spine_exe")
 
-        if mode != "spine" or not spine_path:
+        if not exe:
             QMessageBox.warning(None, tr("err.title"), tr("static.err.no_spine"))
             return
-        if not exe:
+
+        # Resolve the .spine file to use for export
+        if mode == "spine" and spine_path:
+            effective_spine = spine_path
+            self._tmp_spine = None
+        elif mode == "json" and json_path:
+            effective_spine = None  # will be created below
+            self._tmp_spine = None
+        else:
             QMessageBox.warning(None, tr("err.title"), tr("static.err.no_spine"))
             return
 
@@ -682,7 +824,7 @@ class StaticExporterTab:
         QApplication.processEvents()
 
         # Step 1: Export all frames via Spine CLI (single run)
-        from .spine_cli import export_first_frames
+        from .spine_cli import export_first_frames, import_to_spine_project
 
         def on_output(line):
             if line is not None:
@@ -692,15 +834,43 @@ class StaticExporterTab:
         self._stats.setText(tr("static.exporting"))
         QApplication.processEvents()
 
+        # If JSON mode, import into a temporary .spine project first
+        tmp_spine_path = None
+        if effective_spine is None and json_path:
+            import tempfile as _tmpmod
+            fd, tmp_spine_path = _tmpmod.mkstemp(suffix=".spine", prefix="ssk_static_")
+            os.close(fd)
+            self._append("Importing JSON into temporary .spine project...")
+            QApplication.processEvents()
+            imp_result = import_to_spine_project(
+                exe, json_path, tmp_spine_path, on_output=on_output,
+            )
+            if not imp_result.success:
+                self._append(tr("static.log.error", error=imp_result.stderr),
+                             "#f38ba8", bold=True)
+                self._stats.setText(tr("static.stats.failed"))
+                try:
+                    Path(tmp_spine_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return
+            effective_spine = tmp_spine_path
+
         try:
             exported = export_first_frames(
-                exe, spine_path, output_dir, self._custom_settings, checked,
+                exe, effective_spine, output_dir, self._custom_settings, checked,
                 on_output=on_output,
             )
         except Exception as e:
             self._append(tr("static.log.error", error=str(e)), "#f38ba8", bold=True)
             self._stats.setText(tr("static.stats.failed"))
             return
+        finally:
+            if tmp_spine_path:
+                try:
+                    Path(tmp_spine_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
 
         if not exported:
             self._append(tr("static.log.error", error="No frames exported"),
@@ -714,12 +884,19 @@ class StaticExporterTab:
         shape = self._shape_combo.currentData() or "square"
         padding = self._pad_spin.value()
         center = self._center_cb.isChecked()
+        fixed_size = None
+        blur_canvas_size = None
+
+        if shape == "custom":
+            fixed_size = (self._static_w.value(), self._static_h.value())
+            blur_canvas_size = (self._blur_w.value(), self._blur_h.value())
 
         self._append(tr("static.log.normalizing"))
         QApplication.processEvents()
 
         try:
-            _normalize_canvas(exported, shape, padding, center)
+            _normalize_canvas(exported, shape, padding, center,
+                              fixed_size=fixed_size)
         except Exception as e:
             self._append(tr("static.log.error", error=str(e)), "#f9e2af")
 
@@ -731,7 +908,9 @@ class StaticExporterTab:
                 self._append(tr("static.log.blur", anim=name))
                 QApplication.processEvents()
             try:
-                blur_paths = _create_blur_variants(exported, radius, extra)
+                blur_paths = _create_blur_variants(
+                    exported, radius, extra,
+                    blur_canvas_size=blur_canvas_size)
                 self._append(f"Created {len(blur_paths)} blur variant(s)")
             except Exception as e:
                 self._append(tr("static.log.error", error=str(e)), "#f9e2af")

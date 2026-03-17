@@ -401,7 +401,7 @@
 
   "static.tab": "Static Image Exporter",
   "static.info": "Export first frame of each animation as static PNG with uniform canvas and optional vertical blur variants.",
-  "static.info_no_spine": "This tool requires a .spine project file. Open a .spine project from the welcome page.",
+  "static.info_no_spine": "This tool requires a .spine project or a JSON file with the Spine CLI configured.",
   "static.export_settings_btn": "Export Settings...",
   "static.settings_title": "Spine Export Settings",
   "static.settings.render": "Rendering",
@@ -431,6 +431,9 @@
   "static.shape_label": "Canvas shape:",
   "static.shape_square": "Square",
   "static.shape_original": "Original (rectangle)",
+  "static.shape_custom": "Custom size",
+  "static.custom_static_label": "Static canvas:",
+  "static.custom_blur_label": "Blur canvas:",
   "static.padding_label": "Padding (px):",
   "static.center_pivot": "Center pivot (equal edge distances)",
   "static.blur_group": "Blur Variants",
