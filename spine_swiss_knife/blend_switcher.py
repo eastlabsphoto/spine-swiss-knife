@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
 
 from .i18n import tr, language_changed
 from .spine_json import load_spine_json, save_spine_json
+from .slot_renamer import apply_renames, _strip_blend_suffix
 
 
 # ==========================================================================
@@ -183,13 +184,24 @@ class BlendSwitcherTab:
 
         switch_set = set(checked_names)
         switched = 0
+        rename_map = {}
         for slot in spine_data.get("slots", []):
             if slot.get("name") in switch_set and slot.get("blend") in ("multiply", "screen"):
+                old_name = slot["name"]
                 if target_blend == "normal":
                     del slot["blend"]  # normal is default, no key needed
                 else:
                     slot["blend"] = target_blend
+                # Rename slot: strip old blend suffix, add new one
+                base = _strip_blend_suffix(old_name)
+                new_name = f"{base}_{target_blend}"
+                if new_name != old_name:
+                    slot["name"] = new_name
+                    rename_map[old_name] = new_name
                 switched += 1
+        # Update all slot references (skins, animations, clipping, etc.)
+        if rename_map:
+            apply_renames(spine_data, rename_map)
 
         try:
             save_spine_json(json_path, spine_data)

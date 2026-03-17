@@ -32,6 +32,7 @@ from .keyframe_optimizer import KeyframeOptimizerTab
 from .dead_bones import DeadBonesTab
 from .hidden_attachments import HiddenAttachmentsTab
 from .blend_switcher import BlendSwitcherTab
+from .slot_renamer import SlotRenamerTab
 from .splitter import SplitterTab
 from .spine_downgrader import SpineDowngraderTab
 from .texture_unpacker import TextureUnpackerTab
@@ -49,6 +50,7 @@ _SIDEBAR_KEYS = [
     ("app.sidebar.dead_bones", "app.tip.dead_bones"),
     ("app.sidebar.hidden", "app.tip.hidden"),
     ("app.sidebar.blend", "app.tip.blend"),
+    ("app.sidebar.renamer", "app.tip.renamer"),
     ("app.sidebar.splitter", "app.tip.splitter"),
     ("app.sidebar.converter", "app.tip.converter"),
     ("app.sidebar.unpacker", "app.tip.unpacker"),
@@ -256,6 +258,7 @@ class SpineSwissKnifeApp(QMainWindow):
             DeadBonesTab(self._tabs, self._get_config, on_modified=notify),
             HiddenAttachmentsTab(self._tabs, self._get_config, on_modified=notify),
             BlendSwitcherTab(self._tabs, self._get_config, on_modified=notify),
+            SlotRenamerTab(self._tabs, self._get_config, on_modified=notify),
             SplitterTab(self._tabs, self._get_config),
             SpineDowngraderTab(self._tabs, self._get_config),
             TextureUnpackerTab(self._tabs, self._get_config),
@@ -655,26 +658,28 @@ class SpineSwissKnifeApp(QMainWindow):
         tabs = self._tab_instances
         has_atlas = bool(self._atlas_edit.text().strip())
 
-        # JSON-only tabs: Analyzer, Rect Masks, Polygon, Keyframes, Dead Bones, Hidden Att., Blend
-        for tab in [tabs[0], tabs[2], tabs[3], tabs[4], tabs[5], tabs[6], tabs[7]]:
+        # JSON-only tabs: Analyzer, Rect Masks, Polygon, Keyframes, Dead Bones,
+        # Hidden Att., Blend, Slot Renamer
+        for tab in [tabs[0], tabs[2], tabs[3], tabs[4], tabs[5], tabs[6],
+                     tabs[7], tabs[8]]:
             try:
                 tab._analyze()
             except Exception:
                 pass
         # Splitter — Load Animations
         try:
-            tabs[8]._load()
+            tabs[9]._load()
         except Exception:
             pass
         # Static Exporter — reads animation list from JSON
         try:
-            tabs[11]._load()
+            tabs[12]._load()
         except Exception:
             pass
         # Viewer — needs atlas
         if has_atlas:
             try:
-                tabs[12]._load()
+                tabs[13]._load()
             except Exception:
                 pass
 
