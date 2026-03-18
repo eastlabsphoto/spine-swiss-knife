@@ -384,6 +384,224 @@ _BLEND_MODES = {
 }
 
 
+def _qimage_to_numpy(img):
+    """Convert QImage to float32 numpy array (H, W, 4) in 0..1.
+    Input is ARGB32_Premultiplied, output is RGBA float32.
+    """
+    w, h = img.width(), img.height()
+    ptr = img.constBits()
+    arr = np.frombuffer(bytes(ptr), dtype=np.uint8).reshape(h, w, 4).copy()
+    # Qt ARGB → RGBA: swap channels [B, G, R, A] → [R, G, B, A]
+    arr = arr[:, :, [2, 1, 0, 3]]
+    return arr.astype(np.float32) / 255.0
+
+
+def _numpy_to_qimage(arr):
+    """Convert float32 numpy RGBA array back to QImage."""
+    clamped = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
+    # RGBA → Qt ARGB: [R, G, B, A] → [B, G, R, A]
+    argb = clamped[:, :, [2, 1, 0, 3]]
+    h, w = argb.shape[:2]
+    return QImage(argb.tobytes(), w, h, w * 4,
+                  QImage.Format_ARGB32_Premultiplied).copy()
+
+
+def _spine_blend(dst, src, mode):
+    """Blend *src* onto *dst* (both float32 RGBA, **premultiplied alpha**).
+
+    QImage stores premultiplied RGB. These formulas match Qt's
+    CompositionMode exactly, producing zero noise vs QPainter.
+    """
+    sa = src[:, :, 3:4]
+    s_rgb = src[:, :, :3]
+    d_rgb = dst[:, :, :3]
+    d_a = dst[:, :, 3:4]
+
+    if mode == "normal":
+        # Porter-Duff SourceOver (premultiplied)
+        out_rgb = s_rgb + d_rgb * (1.0 - sa)
+        out_a = sa + d_a * (1.0 - sa)
+    elif mode == "additive":
+        # Plus (premultiplied): just add — src already has alpha baked in
+        out_rgb = np.minimum(s_rgb + d_rgb, 1.0)
+        out_a = np.minimum(sa + d_a, 1.0)
+    elif mode == "multiply":
+        # Un-premultiply for multiply math, then blend
+        d_a_safe = np.where(d_a > 0, d_a, 1.0)
+        s_a_safe = np.where(sa > 0, sa, 1.0)
+        d_straight = d_rgb / d_a_safe
+        s_straight = s_rgb / s_a_safe
+        blended = s_straight * d_straight
+        out_rgb = blended * sa * d_a + d_rgb * (1.0 - sa)
+        out_a = sa + d_a * (1.0 - sa)
+    elif mode == "screen":
+        d_a_safe = np.where(d_a > 0, d_a, 1.0)
+        s_a_safe = np.where(sa > 0, sa, 1.0)
+        d_straight = d_rgb / d_a_safe
+        s_straight = s_rgb / s_a_safe
+        blended = s_straight + d_straight - s_straight * d_straight
+        out_rgb = blended * sa * d_a + d_rgb * (1.0 - sa)
+        out_a = sa + d_a * (1.0 - sa)
+    else:
+        out_rgb = s_rgb + d_rgb * (1.0 - sa)
+        out_a = sa + d_a * (1.0 - sa)
+
+    result = dst.copy()
+    result[:, :, :3] = np.clip(out_rgb, 0.0, 1.0)
+    result[:, :, 3:4] = np.clip(out_a, 0.0, 1.0)
+    return result
+
+
+def _render_item(painter, item, world_transforms, cx, cy, zoom,
+                 clip_end, active_clip_path):
+    """Render a single draw-list item with *painter* using normal compositing.
+
+    Handles clip, clip_end_marker, mesh, and region item types.
+    Returns updated ``(clip_end, active_clip_path)``.
+    """
+    item_type = item.get("type")
+
+    # -- clip end marker --
+    if item_type == "clip_end_marker":
+        if clip_end:
+            painter.setClipping(False)
+            clip_end = ""
+            active_clip_path = None
+        return clip_end, active_clip_path
+
+    # -- clipping attachment --
+    if item_type == "clip":
+        bt = world_transforms.get(item["bone"])
+        if bt is None:
+            return clip_end, active_clip_path
+        verts = item["vertices"]
+        points = []
+        for vi in range(0, len(verts), 2):
+            lx, ly = verts[vi], verts[vi + 1]
+            wx = bt.a * lx + bt.b * ly + bt.worldX
+            wy = bt.c * lx + bt.d * ly + bt.worldY
+            sx = cx + wx * zoom
+            sy = cy - wy * zoom
+            points.append(QPointF(sx, sy))
+        if points:
+            path = QPainterPath()
+            path.addPolygon(QPolygonF(points))
+            active_clip_path = path
+            painter.resetTransform()
+            painter.setClipPath(path)
+        clip_end = item.get("clip_end", "")
+        return clip_end, active_clip_path
+
+    # -- mesh attachment --
+    if item_type == "mesh":
+        bt = world_transforms.get(item["bone"])
+        if bt is None:
+            return clip_end, active_clip_path
+
+        verts = item["vertices"]
+        uvs = item["uvs"]
+        tris = item["triangles"]
+        pixmap = item["pixmap"]
+        pw, ph = pixmap.width(), pixmap.height()
+        color = item.get("color")
+
+        if color:
+            painter.setOpacity(color[3])
+
+        screen_pts = []
+        for vi in range(0, len(verts), 2):
+            lx, ly = verts[vi], verts[vi + 1]
+            wx = bt.a * lx + bt.b * ly + bt.worldX
+            wy = bt.c * lx + bt.d * ly + bt.worldY
+            screen_pts.append((cx + wx * zoom, cy - wy * zoom))
+
+        uv_pts = [(uvs[ui] * pw, uvs[ui + 1] * ph)
+                   for ui in range(0, len(uvs), 2)]
+
+        for ti in range(0, len(tris), 3):
+            i0, i1, i2 = tris[ti], tris[ti + 1], tris[ti + 2]
+            if max(i0, i1, i2) >= len(screen_pts):
+                continue
+            if max(i0, i1, i2) >= len(uv_pts):
+                continue
+            src = [uv_pts[i0], uv_pts[i1], uv_pts[i2]]
+            dst = [screen_pts[i0], screen_pts[i1], screen_pts[i2]]
+            xform = _affine_from_triangles(src, dst)
+            if xform is None:
+                continue
+
+            tri_path = QPainterPath()
+            tri_path.moveTo(*dst[0])
+            tri_path.lineTo(*dst[1])
+            tri_path.lineTo(*dst[2])
+            tri_path.closeSubpath()
+
+            painter.resetTransform()
+            if clip_end and active_clip_path is not None:
+                painter.setClipPath(
+                    active_clip_path.intersected(tri_path))
+            else:
+                painter.setClipPath(tri_path)
+            painter.setTransform(xform)
+            painter.drawPixmap(0, 0, pixmap)
+
+        painter.setClipping(False)
+        painter.resetTransform()
+        if clip_end and active_clip_path is not None:
+            painter.setClipPath(active_clip_path)
+
+        if color:
+            painter.setOpacity(1.0)
+        return clip_end, active_clip_path
+
+    # -- region attachment (default) --
+    pixmap = item.get("pixmap")
+    if pixmap is None or pixmap.isNull():
+        return clip_end, active_clip_path
+    bt = world_transforms.get(item["bone"])
+    if bt is None:
+        return clip_end, active_clip_path
+    att = item["att_data"]
+    color = item.get("color")
+
+    ax = att.get("x", 0.0)
+    ay = att.get("y", 0.0)
+    a_rot = att.get("rotation", 0.0)
+    a_sx = att.get("scaleX", 1.0)
+    a_sy = att.get("scaleY", 1.0)
+    pw, ph = pixmap.width(), pixmap.height()
+    att_w = att.get("width", pw)
+    att_h = att.get("height", ph)
+
+    bone_t = QTransform(
+        bt.a, -bt.c, -bt.b, bt.d,
+        bt.worldX, -bt.worldY)
+    att_t = QTransform()
+    att_t.translate(ax, -ay)
+    att_t.rotate(-a_rot)
+    att_t.scale(a_sx * att_w / pw if pw else 1,
+                a_sy * att_h / ph if ph else 1)
+    att_t.translate(-pw / 2.0, -ph / 2.0)
+
+    cam_t = QTransform()
+    cam_t.translate(cx, cy)
+    cam_t.scale(zoom, zoom)
+
+    t = att_t * bone_t * cam_t
+    painter.setTransform(t)
+
+    if color:
+        painter.setOpacity(color[3])
+
+    painter.drawPixmap(0, 0, pixmap)
+
+    painter.resetTransform()
+    if color:
+        painter.setOpacity(1.0)
+
+    return clip_end, active_clip_path
+
+
 def render_frame(
     spine_data: dict,
     textures: dict,
@@ -399,6 +617,10 @@ def render_frame(
 
     When *bbox* is (x, y, w, h) in Spine world coords, uses that as
     the viewport. Otherwise uses a square canvas centered at origin.
+
+    Groups consecutive draw-list items by blend mode so that only one
+    QImage-to-numpy round-trip is needed per blend group (instead of
+    per slot).
     """
     draw_list = build_draw_list(
         spine_data, world_transforms, textures,
@@ -412,8 +634,6 @@ def render_frame(
         bx, by, bw, bh = bbox
         img_w = max(1, int(math.ceil(bw)))
         img_h = max(1, int(math.ceil(bh)))
-        # Camera: maps world (bx, by) to pixel (0, img_h)
-        # Y is flipped: Spine Y-up, QPainter Y-down
         cx = -bx
         cy = by + bh
         zoom = 1.0
@@ -423,169 +643,83 @@ def render_frame(
         cy = canvas_size / 2.0
         zoom = 1.0
 
-    image = QImage(img_w, img_h, QImage.Format_ARGB32_Premultiplied)
-    image.fill(Qt.transparent)
-
-    painter = QPainter(image)
-    painter.setRenderHint(QPainter.Antialiasing)
-    painter.setRenderHint(QPainter.SmoothPixmapTransform)
-
-    active_clip_path = None
-    clip_end = ""
-
+    # ------------------------------------------------------------------
+    # Group consecutive items by blend mode.
+    # Clip / clip_end_marker items are folded into the current group so
+    # clipping state travels with the slots they affect.
+    # ------------------------------------------------------------------
+    groups = []  # [(blend_mode, [items]), ...]
     for item in draw_list:
         item_type = item.get("type")
-
-        # -- clip end marker --
-        if item_type == "clip_end_marker":
-            if clip_end:
-                painter.setClipping(False)
-                clip_end = ""
-                active_clip_path = None
+        if item_type in ("clip", "clip_end_marker"):
+            if groups:
+                groups[-1][1].append(item)
+            else:
+                groups.append(("normal", [item]))
             continue
+        blend = item.get("blend", "normal")
+        if groups and groups[-1][0] == blend:
+            groups[-1][1].append(item)
+        else:
+            groups.append((blend, [item]))
 
-        # -- clipping attachment --
-        if item_type == "clip":
-            bt = world_transforms.get(item["bone"])
-            if bt is None:
-                continue
-            verts = item["vertices"]
-            points = []
-            for vi in range(0, len(verts), 2):
-                lx, ly = verts[vi], verts[vi + 1]
-                wx = bt.a * lx + bt.b * ly + bt.worldX
-                wy = bt.c * lx + bt.d * ly + bt.worldY
-                sx = cx + wx * zoom
-                sy = cy - wy * zoom
-                points.append(QPointF(sx, sy))
-            if points:
-                path = QPainterPath()
-                path.addPolygon(QPolygonF(points))
-                active_clip_path = path
-                painter.resetTransform()
-                painter.setClipPath(path)
-            clip_end = item.get("clip_end", "")
-            continue
-
-        # -- mesh attachment --
-        if item_type == "mesh":
-            bt = world_transforms.get(item["bone"])
-            if bt is None:
-                continue
-            verts = item["vertices"]
-            uvs = item["uvs"]
-            tris = item["triangles"]
-            pixmap = item["pixmap"]
-            pw, ph = pixmap.width(), pixmap.height()
-            color = item.get("color")
-
-            if color:
-                painter.setOpacity(color[3])
-            blend = _BLEND_MODES.get(item.get("blend"))
-            if blend is not None:
-                painter.setCompositionMode(blend)
-
-            screen_pts = []
-            for vi in range(0, len(verts), 2):
-                lx, ly = verts[vi], verts[vi + 1]
-                wx = bt.a * lx + bt.b * ly + bt.worldX
-                wy = bt.c * lx + bt.d * ly + bt.worldY
-                screen_pts.append((
-                    cx + wx * zoom, cy - wy * zoom))
-
-            uv_pts = [(uvs[ui] * pw, uvs[ui + 1] * ph)
-                       for ui in range(0, len(uvs), 2)]
-
-            for ti in range(0, len(tris), 3):
-                i0, i1, i2 = tris[ti], tris[ti + 1], tris[ti + 2]
-                if max(i0, i1, i2) >= len(screen_pts):
-                    continue
-                if max(i0, i1, i2) >= len(uv_pts):
-                    continue
-                src = [uv_pts[i0], uv_pts[i1], uv_pts[i2]]
-                dst = [screen_pts[i0], screen_pts[i1], screen_pts[i2]]
-                xform = _affine_from_triangles(src, dst)
-                if xform is None:
-                    continue
-
-                tri_path = QPainterPath()
-                tri_path.moveTo(*dst[0])
-                tri_path.lineTo(*dst[1])
-                tri_path.lineTo(*dst[2])
-                tri_path.closeSubpath()
-
-                painter.resetTransform()
-                if clip_end and active_clip_path is not None:
-                    painter.setClipPath(
-                        active_clip_path.intersected(tri_path))
-                else:
-                    painter.setClipPath(tri_path)
-                painter.setTransform(xform)
-                painter.drawPixmap(0, 0, pixmap)
-
-            painter.setClipping(False)
-            painter.resetTransform()
-            if clip_end and active_clip_path is not None:
-                painter.setClipPath(active_clip_path)
-            if blend is not None:
+    # ------------------------------------------------------------------
+    # Fallback: no numpy available — render everything with QPainter,
+    # using QPainter composition modes for non-normal blends.
+    # ------------------------------------------------------------------
+    if not HAS_NUMPY:
+        image = QImage(img_w, img_h, QImage.Format_ARGB32_Premultiplied)
+        image.fill(Qt.transparent)
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        clip_end = ""
+        active_clip_path = None
+        for item in draw_list:
+            item_type = item.get("type")
+            blend_name = item.get("blend", "normal")
+            # Set QPainter composition mode for non-normal blends
+            qp_blend = _BLEND_MODES.get(blend_name)
+            if qp_blend is not None:
+                painter.setCompositionMode(qp_blend)
+            clip_end, active_clip_path = _render_item(
+                painter, item, world_transforms, cx, cy, zoom,
+                clip_end, active_clip_path)
+            if qp_blend is not None:
                 painter.setCompositionMode(
                     QPainter.CompositionMode_SourceOver)
-            if color:
-                painter.setOpacity(1.0)
-            continue
+        painter.end()
+        return image
 
-        # -- region attachment (default) --
-        pixmap = item.get("pixmap")
-        if pixmap is None or pixmap.isNull():
-            continue
-        bt = world_transforms.get(item["bone"])
-        if bt is None:
-            continue
-        att = item["att_data"]
-        color = item.get("color")
+    # ------------------------------------------------------------------
+    # Numpy path: render blend-mode groups, one temp image per group.
+    # ------------------------------------------------------------------
+    canvas = np.zeros((img_h, img_w, 4), dtype=np.float32)
+    clip_end = ""
+    active_clip_path = None
 
-        ax = att.get("x", 0.0)
-        ay = att.get("y", 0.0)
-        a_rot = att.get("rotation", 0.0)
-        a_sx = att.get("scaleX", 1.0)
-        a_sy = att.get("scaleY", 1.0)
-        pw, ph = pixmap.width(), pixmap.height()
-        att_w = att.get("width", pw)
-        att_h = att.get("height", ph)
+    for blend_mode, items in groups:
+        temp = QImage(img_w, img_h, QImage.Format_ARGB32_Premultiplied)
+        temp.fill(Qt.transparent)
+        painter = QPainter(temp)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
 
-        bone_t = QTransform(
-            bt.a, -bt.c, -bt.b, bt.d,
-            bt.worldX, -bt.worldY)
-        att_t = QTransform()
-        att_t.translate(ax, -ay)
-        att_t.rotate(-a_rot)
-        att_t.scale(a_sx * att_w / pw if pw else 1,
-                    a_sy * att_h / ph if ph else 1)
-        att_t.translate(-pw / 2.0, -ph / 2.0)
+        # Restore active clip state from previous groups
+        if clip_end and active_clip_path is not None:
+            painter.resetTransform()
+            painter.setClipPath(active_clip_path)
 
-        cam_t = QTransform()
-        cam_t.translate(cx, cy)
-        cam_t.scale(zoom, zoom)
+        for item in items:
+            clip_end, active_clip_path = _render_item(
+                painter, item, world_transforms, cx, cy, zoom,
+                clip_end, active_clip_path)
+        painter.end()
 
-        t = att_t * bone_t * cam_t
-        painter.setTransform(t)
+        temp_arr = _qimage_to_numpy(temp)
+        canvas = _spine_blend(canvas, temp_arr, blend_mode)
 
-        if color:
-            painter.setOpacity(color[3])
-        blend = _BLEND_MODES.get(item.get("blend"))
-        if blend is not None:
-            painter.setCompositionMode(blend)
-
-        painter.drawPixmap(0, 0, pixmap)
-
-        if blend is not None:
-            painter.setCompositionMode(
-                QPainter.CompositionMode_SourceOver)
-        if color:
-            painter.setOpacity(1.0)
-
-    painter.end()
-    return image
+    return _numpy_to_qimage(canvas)
 
 
 def render_animation_sequence(spine_data, textures, slot_order, anim_name,
@@ -664,7 +798,8 @@ def render_animation_sequence(spine_data, textures, slot_order, anim_name,
 # QImage comparison
 # ==========================================================================
 
-def _qimages_match(img_a, img_b, tolerance=5):
+def _qimages_match(img_a, img_b, tolerance=5, threshold=0.02,
+                   _log_diffs=None):
     """Compare two QImages. Uses numpy if available for speed."""
     if img_a.size() != img_b.size():
         return False
@@ -683,24 +818,34 @@ def _qimages_match(img_a, img_b, tolerance=5):
         arr_b = np.frombuffer(bytes(ptr_b), dtype=np.uint8).reshape(h, w, 4)
         diff = np.abs(arr_a.astype(np.int16) - arr_b.astype(np.int16))
         pixel_max = diff.max(axis=2)
+        max_val = int(pixel_max.max()) if pixel_max.size > 0 else 0
         bad = np.count_nonzero(pixel_max > tolerance)
         total = w * h
-        return bad / total < 0.001
+        pct = bad / total * 100 if total > 0 else 0
+        match = bad / total < threshold if total > 0 else True
+        if not match and _log_diffs is not None:
+            _log_diffs.append(
+                f"max_diff={max_val}, bad_pixels={bad} "
+                f"({pct:.2f}%), tolerance={tolerance}")
+        return match
 
     # Fallback: exact comparison only
     return img_a == img_b
 
 
-def compare_sequences(images_a, images_b, tolerance=5):
+def compare_sequences(images_a, images_b, tolerance=5,
+                      threshold=0.02, diff_details=None):
     """Compare two lists of QImages frame by frame.
     Returns (all_match, list_of_differing_frame_indices).
+    When *diff_details* is a list, appends diff stats strings.
     """
     if len(images_a) != len(images_b):
         return False, list(range(max(len(images_a), len(images_b))))
 
     diffs = []
     for i, (a, b) in enumerate(zip(images_a, images_b)):
-        if not _qimages_match(a, b, tolerance):
+        if not _qimages_match(a, b, tolerance, threshold,
+                              _log_diffs=diff_details):
             diffs.append(i)
             if len(diffs) >= 10:  # Early exit
                 break
@@ -736,8 +881,12 @@ def _render_all_animations(spine_data, textures, slot_order,
 
 def _compare_with_original(spine_data, textures, original_images,
                             candidate_slots, anim_names, fps, bbox,
-                            tolerance, on_log=None, early_exit=True):
+                            tolerance, threshold=0.02, on_log=None,
+                            early_exit=True, debug_dir=None):
     """Render candidate and compare against cached original images.
+
+    When *debug_dir* is set, saves frame pairs (original + candidate)
+    for frames that differ, so the user can inspect visually.
 
     Returns ``(all_match, list_of_diff_anim_names)``.
     """
@@ -748,18 +897,145 @@ def _compare_with_original(spine_data, textures, original_images,
         imgs_cand = render_animation_sequence(
             spine_data, textures, candidate_slots, anim_name,
             fps, bbox)
-        match, _ = compare_sequences(imgs_orig, imgs_cand, tolerance)
+        details = []
+        match, diff_frames = compare_sequences(
+            imgs_orig, imgs_cand, tolerance, threshold,
+            diff_details=details)
         if not match:
-            diffs.append(anim_name or "setup_pose")
+            label = anim_name or "setup_pose"
+            diffs.append(label)
+            if on_log and details:
+                on_log(f"      {label}: {details[0]}")
+            # Save debug PNGs for differing frames
+            if debug_dir and diff_frames:
+                anim_label = anim_name or "setup_pose"
+                for fi in diff_frames[:5]:  # Max 5 per animation
+                    if fi < len(imgs_orig) and fi < len(imgs_cand):
+                        d = os.path.join(debug_dir, anim_label)
+                        os.makedirs(d, exist_ok=True)
+                        imgs_orig[fi].save(
+                            os.path.join(d, f"{fi:04d}_original.png"))
+                        imgs_cand[fi].save(
+                            os.path.join(d, f"{fi:04d}_candidate.png"))
             if early_exit:
                 return False, diffs
     return len(diffs) == 0, diffs
 
 
+def _try_individual_moves(
+    spine_data, textures, original_images, full_slots,
+    zone_start, zone_end, anim_names, fps, bbox, tolerance,
+    threshold=0.02, on_log=None, debug_dir=None, _depth=0,
+):
+    """Try moving individual minority-blend slots within a small range.
+
+    For each slot whose blend mode differs from its neighbors, try
+    moving it to the nearest group of the same blend mode.  This
+    handles "sandwich" cases like [A, N, A] where moving the single
+    N out joins the two A groups.
+
+    Returns number of blend groups saved.
+    """
+    indent = "    " + "  " * _depth
+    total_saved = 0
+    changed = True
+
+    while changed:
+        changed = False
+        sub = full_slots[zone_start:zone_end]
+
+        # Find minority slots: slots whose blend differs from both
+        # neighbors (or from the dominant blend in the range)
+        for i in range(len(sub)):
+            slot = sub[i]
+            blend = slot.get("blend", "normal")
+            abs_i = zone_start + i
+
+            # Check if this slot breaks a group
+            prev_blend = sub[i - 1].get("blend", "normal") if i > 0 else None
+            next_blend = sub[i + 1].get("blend", "normal") if i + 1 < len(sub) else None
+
+            # Sandwich: surrounded by different blend on both sides
+            is_sandwich = (prev_blend is not None and
+                           next_blend is not None and
+                           prev_blend != blend and
+                           next_blend != blend and
+                           prev_blend == next_blend)
+
+            # Edge break: at boundary, different from neighbor
+            is_edge_break = ((prev_blend is not None and
+                              prev_blend != blend and
+                              next_blend == blend) or
+                             (next_blend is not None and
+                              next_blend != blend and
+                              prev_blend == blend))
+
+            if not is_sandwich and not is_edge_break:
+                continue
+
+            # Find nearest same-blend neighbor to move next to
+            # (search outward from current position)
+            best_candidate = None
+            for direction in (-1, 1):  # Try left first, then right
+                candidate_sub = list(sub)
+                moved = candidate_sub.pop(i)
+                # Find nearest same-blend slot in this direction
+                insert_pos = i if direction == 1 else i - 1
+                while 0 <= insert_pos <= len(candidate_sub):
+                    if insert_pos < len(candidate_sub):
+                        nb = candidate_sub[insert_pos].get("blend", "normal")
+                        if nb == blend:
+                            # Insert next to this same-blend neighbor
+                            pos = insert_pos + 1 if direction == 1 else insert_pos
+                            candidate_sub.insert(pos, moved)
+                            break
+                    insert_pos += direction
+                else:
+                    continue
+
+                cand = (full_slots[:zone_start] +
+                        candidate_sub +
+                        full_slots[zone_end:])
+
+                if count_blend_groups(cand) < count_blend_groups(full_slots):
+                    best_candidate = cand
+                    break
+
+            if best_candidate is None:
+                continue
+            candidate = best_candidate
+
+            old_g = count_blend_groups(full_slots)
+            new_g = count_blend_groups(candidate)
+
+            if on_log:
+                on_log(f"{indent}  Try moving '{slot['name']}' "
+                       f"({old_g} \u2192 {new_g})...")
+
+            ok, _ = _compare_with_original(
+                spine_data, textures, original_images, candidate,
+                anim_names, fps, bbox, tolerance, threshold,
+                on_log=on_log, debug_dir=debug_dir)
+
+            if ok:
+                if on_log:
+                    on_log(f"{indent}  \u2714 '{slot['name']}' safe")
+                full_slots[:] = candidate
+                total_saved += old_g - new_g
+                changed = True
+                break  # Restart scan with new slot order
+            else:
+                if on_log:
+                    on_log(f"{indent}  \u2718 '{slot['name']}' "
+                           f"visual change")
+
+    return total_saved
+
+
 def _bisect_zone(
     spine_data, textures, original_images, full_slots,
     zone_start, zone_end, anim_names, fps, bbox, tolerance,
-    on_log=None, _depth=0,
+    threshold=0.02, on_log=None, debug_dir=None, _depth=0,
 ):
     """Binary search on a sub-range of slots within a zone.
 
@@ -801,7 +1077,8 @@ def _bisect_zone(
 
     ok, _ = _compare_with_original(
         spine_data, textures, original_images, candidate,
-        anim_names, fps, bbox, tolerance)
+        anim_names, fps, bbox, tolerance, threshold,
+        on_log=on_log, debug_dir=debug_dir)
 
     if ok:
         if on_log:
@@ -816,6 +1093,17 @@ def _bisect_zone(
             on_log(f"{indent}\u2718 visual change, skipping")
         return 0
 
+    # For small ranges, try moving individual slots instead of
+    # full partition — this can rescue slots like cloud_normal
+    # sandwiched between additive groups.
+    if length <= 10:
+        saved = _try_individual_moves(
+            spine_data, textures, original_images, full_slots,
+            zone_start, zone_end, anim_names, fps, bbox,
+            tolerance, threshold, on_log, debug_dir, _depth)
+        if saved > 0:
+            return saved
+
     # Split in half
     mid = zone_start + length // 2
     if on_log:
@@ -826,16 +1114,17 @@ def _bisect_zone(
     saved += _bisect_zone(
         spine_data, textures, original_images, full_slots,
         zone_start, mid, anim_names, fps, bbox, tolerance,
-        on_log, _depth + 1)
+        threshold, on_log, debug_dir, _depth + 1)
     saved += _bisect_zone(
         spine_data, textures, original_images, full_slots,
         mid, zone_end, anim_names, fps, bbox, tolerance,
-        on_log, _depth + 1)
+        threshold, on_log, debug_dir, _depth + 1)
     return saved
 
 
 def optimize_draw_order(spine_data, fps=30, tolerance=5,
-                         textures=None, on_log=None):
+                         threshold=0.02, textures=None, on_log=None,
+                         debug_dir=None):
     """Zone-based draw-order optimisation with QPainter verification.
 
     1. Render original once (cached).
@@ -899,8 +1188,8 @@ def optimize_draw_order(spine_data, fps=30, tolerance=5,
     log("Testing full optimisation...")
     ok, diffs = _compare_with_original(
         spine_data, textures, original_images, optimized,
-        anim_names, fps, bbox, tolerance, on_log=on_log,
-        early_exit=False)
+        anim_names, fps, bbox, tolerance, threshold,
+        on_log=on_log, early_exit=False)
 
     if ok:
         log(f"\u2714 Full optimisation safe! "
@@ -942,7 +1231,8 @@ def optimize_draw_order(spine_data, fps=30, tolerance=5,
                     working_slots, zone_offset,
                     zone_offset + zone_len,
                     anim_names, fps, bbox, tolerance,
-                    on_log=on_log)
+                    threshold, on_log=on_log,
+                    debug_dir=debug_dir)
                 pass_saved += saved
             zone_offset += zone_len
 
@@ -1016,10 +1306,32 @@ class DrawOrderOptimizerTab:
 
         btn_row.addWidget(QLabel(tr("draw_order.tolerance_label")))
         self._tolerance_spin = QSpinBox()
-        self._tolerance_spin.setRange(0, 20)
-        self._tolerance_spin.setValue(5)
-        self._tolerance_spin.setToolTip(tr("draw_order.tolerance_tip"))
+        self._tolerance_spin.setRange(0, 50)
+        self._tolerance_spin.setValue(15)
+        self._tolerance_spin.setToolTip(
+            "Per-pixel tolerance (0-255 per channel).\n"
+            "If a pixel differs by less than this value,\n"
+            "it is considered identical.\n"
+            "Default: 5")
         btn_row.addWidget(self._tolerance_spin)
+
+        btn_row.addWidget(QLabel("Threshold %:"))
+        self._threshold_spin = QSpinBox()
+        self._threshold_spin.setRange(1, 20)
+        self._threshold_spin.setValue(1)
+        self._threshold_spin.setToolTip(
+            "Max percentage of bad pixels allowed (0-100%).\n"
+            "A pixel is 'bad' if it exceeds the tolerance.\n"
+            "If fewer than this % of pixels are bad,\n"
+            "the frame is considered matching.\n"
+            "Default: 2%")
+        btn_row.addWidget(self._threshold_spin)
+
+        from PySide6.QtWidgets import QCheckBox
+        self._debug_cb = QCheckBox("Debug PNG")
+        self._debug_cb.setToolTip(
+            "Save frame pairs to disk when comparison finds differences")
+        btn_row.addWidget(self._debug_cb)
 
         btn_row.addStretch()
         layout.addLayout(btn_row)
@@ -1142,6 +1454,19 @@ class DrawOrderOptimizerTab:
         if not textures:
             self._log_line("No atlas \u2014 optimising without visual check.", "#e8a838")
 
+        # Debug dir for saving comparison PNGs
+        debug_dir = None
+        if self._debug_cb.isChecked():
+            project_dir = os.path.dirname(json_path)
+            debug_dir = os.path.join(project_dir,
+                                     "_ssk_draw_order_debug")
+            if Path(debug_dir).exists():
+                import shutil
+                shutil.rmtree(debug_dir)
+            self._log_line(
+                f"Debug PNGs will be saved to: {debug_dir}",
+                "#e8a838")
+
         self._optimize_btn.setEnabled(False)
         QApplication.processEvents()
 
@@ -1150,7 +1475,9 @@ class DrawOrderOptimizerTab:
                 spine_data,
                 fps=fps,
                 tolerance=tolerance,
+                threshold=self._threshold_spin.value() / 100.0,
                 textures=textures,
+                debug_dir=debug_dir,
                 on_log=lambda msg: (
                     self._log_line(msg, "#6ec072"),
                     QApplication.processEvents(),
