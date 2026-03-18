@@ -32,6 +32,7 @@ from .keyframe_optimizer import KeyframeOptimizerTab
 from .dead_bones import DeadBonesTab
 from .hidden_attachments import HiddenAttachmentsTab
 from .blend_switcher import BlendSwitcherTab
+from .draw_order_optimizer import DrawOrderOptimizerTab
 from .slot_renamer import SlotRenamerTab
 from .splitter import SplitterTab
 from .spine_downgrader import SpineDowngraderTab
@@ -50,6 +51,7 @@ _SIDEBAR_KEYS = [
     ("app.sidebar.dead_bones", "app.tip.dead_bones"),
     ("app.sidebar.hidden", "app.tip.hidden"),
     ("app.sidebar.blend", "app.tip.blend"),
+    ("app.sidebar.draw_order", "app.tip.draw_order"),
     ("app.sidebar.renamer", "app.tip.renamer"),
     ("app.sidebar.splitter", "app.tip.splitter"),
     ("app.sidebar.converter", "app.tip.converter"),
@@ -133,24 +135,7 @@ class SpineSwissKnifeApp(QMainWindow):
         main_layout.setContentsMargins(12, 12, 12, 12)
         main_layout.setSpacing(8)
 
-        # Update banner (hidden by default)
-        self._update_banner = QFrame()
-        self._update_banner.setObjectName("updateBanner")
-        banner_layout = QHBoxLayout(self._update_banner)
-        banner_layout.setContentsMargins(8, 4, 8, 4)
-        self._update_label = QLabel("")
-        self._update_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        banner_layout.addWidget(self._update_label)
-        self._update_btn = QPushButton(tr("update.btn"))
-        self._update_btn.setCursor(Qt.PointingHandCursor)
-        self._update_btn.clicked.connect(self._do_update)
-        banner_layout.addWidget(self._update_btn)
-        self._update_banner.hide()
-        main_layout.addWidget(self._update_banner)
-
-        # Store update info for later use
-        self._pending_update_url = ""
-        self._pending_update_changelog = ""
+        # (Update banner is on the welcome page)
 
         # Config panel
         config_panel = QWidget()
@@ -258,6 +243,7 @@ class SpineSwissKnifeApp(QMainWindow):
             DeadBonesTab(self._tabs, self._get_config, on_modified=notify),
             HiddenAttachmentsTab(self._tabs, self._get_config, on_modified=notify),
             BlendSwitcherTab(self._tabs, self._get_config, on_modified=notify),
+            DrawOrderOptimizerTab(self._tabs, self._get_config, on_modified=notify),
             SlotRenamerTab(self._tabs, self._get_config, on_modified=notify),
             SplitterTab(self._tabs, self._get_config),
             SpineDowngraderTab(self._tabs, self._get_config),
@@ -659,65 +645,31 @@ class SpineSwissKnifeApp(QMainWindow):
         has_atlas = bool(self._atlas_edit.text().strip())
 
         # JSON-only tabs: Analyzer, Rect Masks, Polygon, Keyframes, Dead Bones,
-        # Hidden Att., Blend, Slot Renamer
+        # Hidden Att., Blend, Draw Order, Slot Renamer
         for tab in [tabs[0], tabs[2], tabs[3], tabs[4], tabs[5], tabs[6],
-                     tabs[7], tabs[8]]:
+                     tabs[7], tabs[8], tabs[9]]:
             try:
                 tab._analyze()
             except Exception:
                 pass
         # Splitter — Load Animations
         try:
-            tabs[9]._load()
+            tabs[10]._load()
         except Exception:
             pass
         # Static Exporter — reads animation list from JSON
         try:
-            tabs[12]._load()
+            tabs[13]._load()
         except Exception:
             pass
         # Viewer — needs atlas
         if has_atlas:
             try:
-                tabs[13]._load()
+                tabs[14]._load()
             except Exception:
                 pass
 
     # --- Auto-update ---
 
     def show_update_available(self, version: str, zipball_url: str, changelog: str):
-        self._pending_update_url = zipball_url
-        self._pending_update_changelog = changelog
-        self._update_label.setText(tr("update.available", version=version))
-        self._update_banner.show()
-
-    def _do_update(self):
-        from .updater import perform_update, restart_app
-
-        msg = tr("update.confirm",
-                 version=self._update_label.text(),
-                 changelog=self._pending_update_changelog or "—")
-        reply = QMessageBox.question(self, tr("confirm.title"), msg,
-                                     QMessageBox.Yes | QMessageBox.No)
-        if reply != QMessageBox.Yes:
-            return
-
-        progress = QProgressDialog(tr("update.downloading"), None, 0, 0, self)
-        progress.setWindowTitle(tr("update.btn"))
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setCancelButton(None)
-        progress.show()
-
-        try:
-            from PySide6.QtWidgets import QApplication
-            QApplication.processEvents()
-            progress.setLabelText(tr("update.installing"))
-            QApplication.processEvents()
-            perform_update(self._pending_update_url)
-            progress.close()
-            QMessageBox.information(self, tr("done.title"), tr("update.restart"))
-            restart_app()
-        except Exception as e:
-            progress.close()
-            QMessageBox.warning(self, tr("err.title"),
-                                tr("update.failed", error=str(e)))
+        self._welcome_page.show_update_available(version, zipball_url, changelog)

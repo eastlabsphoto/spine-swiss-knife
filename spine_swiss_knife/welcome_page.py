@@ -5,6 +5,7 @@ from pathlib import Path
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QGroupBox, QFileDialog, QSizePolicy, QMessageBox,
+    QFrame, QProgressDialog, QApplication,
 )
 from PySide6.QtCore import Qt, Signal
 
@@ -108,6 +109,26 @@ class WelcomePage(QWidget):
 
         cl.addWidget(self._path_group)
 
+        # Update banner (hidden by default)
+        self._update_banner = QFrame()
+        self._update_banner.setObjectName("updateBanner")
+        banner_layout = QHBoxLayout(self._update_banner)
+        banner_layout.setContentsMargins(8, 4, 8, 4)
+        self._update_label = QLabel("")
+        self._update_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        banner_layout.addWidget(self._update_label)
+        self._update_btn = QPushButton(tr("update.btn"))
+        self._update_btn.setCursor(Qt.PointingHandCursor)
+        self._update_btn.clicked.connect(self._do_update)
+        banner_layout.addWidget(self._update_btn)
+        self._update_banner.hide()
+        cl.addWidget(self._update_banner)
+
+        # Store update info
+        self._pending_update_url = ""
+        self._pending_update_changelog = ""
+        self._update_worker = None
+
         # Center container horizontally
         h = QHBoxLayout()
         h.addStretch()
@@ -182,6 +203,45 @@ class WelcomePage(QWidget):
         if reply == QMessageBox.Cancel:
             return
         self.spine_mode_selected.emit(path, reply == QMessageBox.Yes, "")
+
+    # -- Auto-update --
+
+    def show_update_available(self, version: str, zipball_url: str, changelog: str):
+        self._pending_update_url = zipball_url
+        self._pending_update_changelog = changelog
+        self._update_label.setText(tr("update.available", version=version))
+        self._update_banner.show()
+
+    def _do_update(self):
+        from .updater import UpdateWorker, restart_app
+
+        msg = tr("update.confirm",
+                 version=self._update_label.text(),
+                 changelog=self._pending_update_changelog or "—")
+        reply = QMessageBox.question(self, tr("confirm.title"), msg,
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        self._update_btn.setEnabled(False)
+        self._update_label.setText(tr("update.downloading"))
+
+        self._update_worker = UpdateWorker(self._pending_update_url, self)
+        self._update_worker.progress.connect(
+            lambda text: self._update_label.setText(text))
+        self._update_worker.finished.connect(self._on_update_finished)
+        self._update_worker.failed.connect(self._on_update_failed)
+        self._update_worker.start()
+
+    def _on_update_finished(self):
+        from .updater import restart_app
+        self._update_label.setText(tr("update.restart"))
+        QApplication.processEvents()
+        restart_app()
+
+    def _on_update_failed(self, error: str):
+        self._update_btn.setEnabled(True)
+        self._update_label.setText(tr("update.failed", error=error))
 
     # -- Retranslate --
 

@@ -508,6 +508,106 @@ def export_first_frames(
     return results
 
 
+def export_animation_pngs(
+    exe: str,
+    spine_file: str,
+    output_dir: str,
+    fps: int = 10,
+    timeout: int = 600,
+    on_output: Optional[Callable[[str], None]] = None,
+) -> bool:
+    """Export all animations as PNG sequences for visual comparison.
+
+    Unlike ``export_first_frames`` this exports *all* frames at the given
+    *fps* and does not filter or rename output files — the raw Spine CLI
+    directory structure is preserved for recursive comparison.
+
+    Returns ``True`` on success.
+    """
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    # Full export-png settings matching static_exporter defaults.
+    # All fields must be present — Spine 3.7 crashes on missing keys.
+    settings: dict = {
+        "class": "export-png",
+        "name": "PNG",
+        "output": str(out.resolve()),
+        "open": False,
+        "exportType": "animation",
+        "skeletonType": "single",
+        "animationType": "all",
+        "animation": None,
+        "skinType": "current",
+        "skinNone": False,
+        "skin": None,
+        "maxBounds": False,
+        "renderImages": True,
+        "renderBones": False,
+        "renderOthers": False,
+        "linearFiltering": True,
+        "scale": 100,
+        "fitWidth": 0,
+        "fitHeight": 0,
+        "enlarge": False,
+        "background": None,
+        "fps": fps,
+        "lastFrame": False,
+        "cropX": -2000,
+        "cropY": -2000,
+        "cropWidth": 4000,
+        "cropHeight": 4000,
+        "rangeStart": -1,
+        "rangeEnd": -1,
+        "pad": False,
+        "msaa": 0,
+        "packAtlas": None,
+        "compression": 1,
+    }
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".json", prefix="ssk_dopt_")
+    try:
+        with open(fd, "w", encoding="utf-8") as f:
+            _json.dump(settings, f)
+    except Exception:
+        import os
+        os.close(fd)
+        raise
+
+    try:
+        cmd = [exe]
+        version = read_spine_file_version(spine_file)
+        if version:
+            cmd += ["-u", version]
+        cmd += ["-i", spine_file, "-e", tmp_path]
+
+        if on_output:
+            on_output(f"Running: {' '.join(cmd)}")
+
+        try:
+            rc, stdout, stderr = _run_cli(cmd, timeout=timeout, on_output=on_output)
+        except Exception as e:
+            if on_output:
+                on_output(f"ERROR: {e}")
+            return False
+
+        if rc != 0:
+            if on_output:
+                on_output(f"Export failed (exit {rc}): {stderr}")
+            return False
+    finally:
+        try:
+            Path(tmp_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    # Verify at least one PNG was produced
+    png_count = sum(1 for _ in out.rglob("*.png"))
+    if on_output:
+        on_output(f"Exported {png_count} frame(s)")
+    return png_count > 0
+
+
 def import_to_spine_project(
     exe: str, json_path: str, spine_file: str,
     timeout: int = 600,

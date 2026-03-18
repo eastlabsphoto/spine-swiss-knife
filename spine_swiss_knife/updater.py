@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QThread, Signal, QObject
 
 from . import __version__
 
@@ -105,6 +105,26 @@ class UpdateChecker(QThread):
             return ""
 
 
+class UpdateWorker(QThread):
+    """Background thread for downloading and installing updates."""
+
+    finished = Signal()        # success
+    failed = Signal(str)       # error message
+    progress = Signal(str)     # status text for UI
+
+    def __init__(self, download_url: str, parent=None):
+        super().__init__(parent)
+        self._url = download_url
+
+    def run(self):
+        try:
+            self.progress.emit("Downloading update...")
+            perform_update(self._url)
+            self.finished.emit()
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
 def perform_update(download_url: str) -> None:
     """Download update and replace app files.
 
@@ -156,6 +176,46 @@ def _update_source(extracted_root: Path) -> None:
             shutil.copy2(str(item), str(dest))
 
 
+def _resolve_macos_app_bundle() -> Path:
+    """Return the real .app bundle path, resolving AppTranslocation.
+
+    When macOS translocates a downloaded app the running binary sits
+    under a read-only ``/var/folders/.../AppTranslocation/...`` path.
+    We detect this and fall back to the original location reported by
+    the ``xattr`` metadata or ``/Applications`` copy.
+    """
+    app_bundle = Path(sys.executable).parent.parent.parent
+
+    # Check if running from AppTranslocation (read-only sandbox)
+    if "/AppTranslocation/" in str(app_bundle):
+        # Try resolving via the bookmark/original path
+        try:
+            resolved = app_bundle.resolve()
+            if "/AppTranslocation/" not in str(resolved):
+                return resolved
+        except OSError:
+            pass
+
+        # Heuristic: look for the same .app name in common locations
+        app_name = app_bundle.name  # e.g. "SpineSwissKnife.app"
+        for candidate_dir in [
+            Path.home() / "Downloads",
+            Path("/Applications"),
+            Path.home() / "Desktop",
+        ]:
+            candidate = candidate_dir / app_name
+            if candidate.is_dir() and (candidate / "Contents" / "MacOS").is_dir():
+                return candidate
+
+        raise RuntimeError(
+            f"App is running from a read-only macOS AppTranslocation path.\n\n"
+            f"Please move SpineSwissKnife.app to /Applications or your Desktop "
+            f"and relaunch, then try updating again."
+        )
+
+    return app_bundle
+
+
 def _update_frozen(extracted_root: Path) -> None:
     """Replace frozen app contents from platform-specific release ZIP.
 
@@ -163,8 +223,7 @@ def _update_frozen(extracted_root: Path) -> None:
     Windows: extracted_root contains SpineSwissKnife/ (with .exe)
     """
     if platform.system() == "Darwin":
-        # .app bundle: sys.executable = .../SpineSwissKnife.app/Contents/MacOS/SpineSwissKnife
-        app_bundle = Path(sys.executable).parent.parent.parent
+        app_bundle = _resolve_macos_app_bundle()
         new_app = extracted_root / "SpineSwissKnife.app"
         if not new_app.is_dir():
             # ZIP root IS the .app bundle (no wrapper folder)
@@ -222,8 +281,8 @@ def restart_app() -> None:
         sys.exit(0)
 
     if IS_FROZEN:
-        # macOS: relaunch the app bundle
-        app_bundle = Path(sys.executable).parent.parent.parent
+        # macOS: relaunch the app bundle (use resolved path)
+        app_bundle = _resolve_macos_app_bundle()
         subprocess.Popen(["open", "-n", str(app_bundle)])
     else:
         subprocess.Popen([sys.executable] + sys.argv)
