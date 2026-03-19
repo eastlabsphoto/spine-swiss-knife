@@ -26,6 +26,7 @@ _RELEASE_API = f"https://api.github.com/repos/{_REPO}/releases/latest"
 _APP_DIR = Path(__file__).parent
 
 IS_FROZEN = getattr(sys, "frozen", False)
+_PENDING_EXTERNAL_RESTART = False
 
 _VERSION_RE = re.compile(r'__version__\s*=\s*["\']([^"\']+)["\']')
 
@@ -49,13 +50,29 @@ def _parse_version(v: str) -> tuple[int, ...]:
     return tuple(int(x) for x in v.lstrip("v").split("."))
 
 
-def _get_frozen_download_url(version: str) -> str:
-    """Get the platform-specific download URL from GitHub Releases."""
-    if platform.system() == "Darwin":
-        asset_name = "SpineSwissKnife-macOS.zip"
-    else:
-        asset_name = "SpineSwissKnife-Windows.zip"
-    return f"https://github.com/{_REPO}/releases/download/v{version}/{asset_name}"
+def _platform_release_asset_name(system_name: str | None = None) -> str:
+    """Return the expected frozen release asset name for the current platform."""
+    if (system_name or platform.system()) == "Darwin":
+        return "SpineSwissKnife-macOS.zip"
+    return "SpineSwissKnife-Windows.zip"
+
+
+def _find_release_asset_url(release: dict, system_name: str | None = None) -> str:
+    """Return browser_download_url for the platform-specific release asset."""
+    asset_name = _platform_release_asset_name(system_name)
+    for asset in release.get("assets", []):
+        if asset.get("name") == asset_name:
+            url = asset.get("browser_download_url", "")
+            if url:
+                return url
+    raise KeyError(f"Release asset not found: {asset_name}")
+
+
+def _fetch_latest_release() -> dict:
+    """Fetch GitHub Releases latest JSON payload."""
+    req = Request(_RELEASE_API, headers={"Accept": "application/vnd.github.v3+json"})
+    with _urlopen(req) as resp:
+        return json.loads(resp.read().decode())
 
 
 class UpdateChecker(QThread):
@@ -65,25 +82,30 @@ class UpdateChecker(QThread):
 
     def run(self):
         try:
-            # Fetch remote __init__.py to get version
-            with _urlopen(_RAW_INIT) as resp:
-                init_src = resp.read().decode()
-
-            match = _VERSION_RE.search(init_src)
-            if not match:
-                return
-
-            remote_ver = match.group(1)
-            if _parse_version(remote_ver) <= _parse_version(__version__):
-                return
-
-            changelog = self._fetch_changelog()
-
-            # For frozen builds, point to platform-specific release asset
             if IS_FROZEN:
-                url = _get_frozen_download_url(remote_ver)
+                release = _fetch_latest_release()
+                remote_ver = release.get("tag_name", "").lstrip("v")
+                if not remote_ver:
+                    return
+                if _parse_version(remote_ver) <= _parse_version(__version__):
+                    return
+                url = _find_release_asset_url(release)
+                changelog = release.get("body", "").strip() or self._fetch_changelog()
             else:
+                # Fetch remote __init__.py to get version
+                with _urlopen(_RAW_INIT) as resp:
+                    init_src = resp.read().decode()
+
+                match = _VERSION_RE.search(init_src)
+                if not match:
+                    return
+
+                remote_ver = match.group(1)
+                if _parse_version(remote_ver) <= _parse_version(__version__):
+                    return
+
                 url = _ZIP_URL
+                changelog = self._fetch_changelog()
 
             self.update_available.emit(remote_ver, url, changelog)
 
@@ -134,6 +156,8 @@ def perform_update(download_url: str) -> None:
     tmp_dir = tempfile.mkdtemp(prefix="ssk_update_")
     zip_path = os.path.join(tmp_dir, "update.zip")
 
+    cleanup_tmp_dir = True
+
     try:
         with _urlopen(download_url, timeout=120) as resp:
             with open(zip_path, "wb") as f:
@@ -150,12 +174,13 @@ def perform_update(download_url: str) -> None:
         extracted_root = Path(extract_dir) / roots[0]
 
         if IS_FROZEN:
-            _update_frozen(extracted_root)
+            cleanup_tmp_dir = _update_frozen(extracted_root, Path(tmp_dir))
         else:
             _update_source(extracted_root)
 
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        if cleanup_tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _update_source(extracted_root: Path) -> None:
@@ -216,12 +241,15 @@ def _resolve_macos_app_bundle() -> Path:
     return app_bundle
 
 
-def _update_frozen(extracted_root: Path) -> None:
+def _update_frozen(extracted_root: Path, staging_dir: Path) -> bool:
     """Replace frozen app contents from platform-specific release ZIP.
 
     macOS: extracted_root contains SpineSwissKnife.app/
     Windows: extracted_root contains SpineSwissKnife/ (with .exe)
     """
+    global _PENDING_EXTERNAL_RESTART
+    _PENDING_EXTERNAL_RESTART = True
+
     if platform.system() == "Darwin":
         app_bundle = _resolve_macos_app_bundle()
         new_app = extracted_root / "SpineSwissKnife.app"
@@ -231,20 +259,31 @@ def _update_frozen(extracted_root: Path) -> None:
                 new_app = extracted_root
             else:
                 raise RuntimeError("SpineSwissKnife.app not found in archive")
-
-        # Replace Contents/ (skip MacOS/SpineSwissKnife binary — it's running)
-        new_contents = new_app / "Contents"
-        old_contents = app_bundle / "Contents"
-        for item in new_contents.rglob("*"):
-            if not item.is_file():
-                continue
-            rel = item.relative_to(new_contents)
-            # Skip the running binary itself
-            if str(rel) == os.path.join("MacOS", "SpineSwissKnife"):
-                continue
-            dest = old_contents / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(str(item), str(dest))
+        script_path = Path(tempfile.gettempdir()) / "ssk_update_mac.sh"
+        pid = os.getpid()
+        script_path.write_text(
+            "#!/bin/sh\n"
+            f'PID="{pid}"\n'
+            f'SRC="{new_app}"\n'
+            f'DST="{app_bundle}"\n'
+            f'STAGE="{staging_dir}"\n'
+            'while kill -0 "$PID" 2>/dev/null; do\n'
+            '  sleep 1\n'
+            'done\n'
+            'rm -rf "$DST"\n'
+            'ditto "$SRC" "$DST"\n'
+            'open -n "$DST"\n'
+            'rm -rf "$STAGE"\n'
+            'rm -f "$0"\n',
+            encoding="utf-8",
+        )
+        script_path.chmod(0o755)
+        subprocess.Popen(
+            ["/bin/sh", str(script_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
 
     else:
         # Windows: sys.executable = ...\SpineSwissKnife\SpineSwissKnife.exe
@@ -257,13 +296,23 @@ def _update_frozen(extracted_root: Path) -> None:
             else:
                 raise RuntimeError("SpineSwissKnife/ not found in archive")
 
-        # Write a batch script that replaces files after we exit
+        # Write a batch script that replaces files after we exit.
         bat_path = Path(tempfile.gettempdir()) / "ssk_update.bat"
+        pid = os.getpid()
         bat_path.write_text(
             f'@echo off\n'
-            f'timeout /t 2 /nobreak >nul\n'
-            f'xcopy /e /y /q "{new_dir}\\*" "{app_dir}\\"\n'
+            f'set "PID={pid}"\n'
+            f':waitloop\n'
+            f'tasklist /FI "PID eq %PID%" 2>NUL | findstr /R "\\<%PID%\\>" >NUL\n'
+            f'if not errorlevel 1 (\n'
+            f'  timeout /t 1 /nobreak >nul\n'
+            f'  goto waitloop\n'
+            f')\n'
+            f'robocopy "{new_dir}" "{app_dir}" /E /R:3 /W:1 /NFL /NDL /NJH /NJS /NP >nul\n'
+            f'set "RC=%ERRORLEVEL%"\n'
+            f'if %RC% GEQ 8 exit /b %RC%\n'
             f'start "" "{app_dir}\\SpineSwissKnife.exe"\n'
+            f'rmdir /s /q "{staging_dir}"\n'
             f'del "%~f0"\n',
             encoding="utf-8",
         )
@@ -273,11 +322,13 @@ def _update_frozen(extracted_root: Path) -> None:
             if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
         )
 
+    return False
+
 
 def restart_app() -> None:
     """Restart the application."""
-    if IS_FROZEN and platform.system() == "Windows":
-        # Windows: batch script already handles restart
+    if IS_FROZEN and _PENDING_EXTERNAL_RESTART:
+        # Frozen updates hand off restart to an external updater script.
         sys.exit(0)
 
     if IS_FROZEN:

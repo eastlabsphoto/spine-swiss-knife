@@ -145,7 +145,9 @@ def extract_spine_frames(atlas_path: str, output_dir: str) -> int:
             else:
                 frame_image = atlas_image.crop((x, y, x + w, y + h))
             restored = Image.new("RGBA", (orig_w, orig_h), (0, 0, 0, 0))
-            restored.paste(frame_image, (offset_x, offset_y))
+            paste_y = max(0, orig_h - frame_image.height - offset_y)
+            # libGDX/Spine atlas offsetY is measured from the bottom edge.
+            restored.paste(frame_image, (offset_x, paste_y))
             base = os.path.splitext(frame["filename"])[0]
             out_path = os.path.join(output_dir, f"{base}.png")
             os.makedirs(os.path.dirname(out_path), exist_ok=True)

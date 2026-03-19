@@ -943,7 +943,7 @@ def _bisect_zone(
     return saved
 
 
-def optimize_draw_order(spine_data, fps=30, tolerance=5,
+def optimize_draw_order(spine_data, fps=60, tolerance=5,
                          threshold=0.02, textures=None, on_log=None,
                          debug_dir=None, baseline_data=None):
     """Zone-based draw-order optimisation with QPainter verification.
@@ -1273,7 +1273,7 @@ class DrawOrderOptimizerTab:
             return
 
         self._log.clear()
-        fps = 30
+        fps = 60
         tolerance = self._tolerance_spin.value()
 
         # Load textures

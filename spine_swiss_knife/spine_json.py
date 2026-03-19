@@ -84,3 +84,17 @@ def iter_clipping_attachments(skins: dict):
 def attachment_image_key(att_name: str, att_data: dict) -> str:
     """Return the image lookup key for an attachment (path field or att_name)."""
     return att_data.get("path", att_name)
+
+
+def clip_end_marker_after_slot(att_name: str | None, att_data: dict | None) -> bool:
+    """Return True when a clip end marker must be emitted after this slot.
+
+    Spine clipping ends after the end slot is processed. That only matters for
+    slots that actually render a drawable attachment. Empty slots, clipping
+    attachments, and unsupported attachment types can end clipping immediately.
+    """
+    if att_name is None:
+        return False
+
+    att_type = (att_data or {}).get("type")
+    return att_type is None or att_type in ("region", "mesh")

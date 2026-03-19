@@ -17,7 +17,10 @@ from PySide6.QtGui import (
 )
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
-from .spine_json import load_spine_json, normalize_skins, attachment_image_key
+from .spine_json import (
+    load_spine_json, normalize_skins, attachment_image_key,
+    clip_end_marker_after_slot,
+)
 from .texture_unpacker import parse_spine_atlas
 from .style import CANVAS_BG, SUBTEXT
 from .i18n import tr, language_changed
@@ -722,6 +725,30 @@ def load_atlas_textures(atlas_path: str) -> dict[str, QPixmap]:
     atlas_dir = os.path.dirname(atlas_path)
     textures: dict[str, QPixmap] = {}
 
+    def restore_trimmed_frame(frame: dict, cropped: QPixmap) -> QPixmap:
+        """Restore a trimmed atlas region onto its original transparent canvas."""
+        orig_w = max(1, int(frame.get("orig_w", cropped.width())))
+        orig_h = max(1, int(frame.get("orig_h", cropped.height())))
+        offset_x = int(frame.get("offset_x", 0))
+        offset_y = int(frame.get("offset_y", 0))
+        paste_y = max(0, orig_h - cropped.height() - offset_y)
+
+        if (
+            cropped.width() == orig_w
+            and cropped.height() == orig_h
+            and offset_x == 0
+            and paste_y == 0
+        ):
+            return cropped
+
+        restored = QPixmap(orig_w, orig_h)
+        restored.fill(Qt.transparent)
+        painter = QPainter(restored)
+        # libGDX/Spine atlas offsetY is measured from the bottom edge.
+        painter.drawPixmap(offset_x, paste_y, cropped)
+        painter.end()
+        return restored
+
     for image_name, frames, _page_scale in pages:
         image_path = os.path.join(atlas_dir, image_name)
         if not os.path.isfile(image_path):
@@ -748,6 +775,8 @@ def load_atlas_textures(atlas_path: str) -> dict[str, QPixmap]:
                 cropped = cropped.transformed(xform)
             else:
                 cropped = page_pixmap.copy(x, y, w, h)
+
+            cropped = restore_trimmed_frame(frame, cropped)
 
             key = os.path.splitext(fname)[0] if "." in fname else fname
             textures[key] = cropped
@@ -1197,20 +1226,23 @@ def build_draw_list(
         slot_name = slot["name"]
         bone_name = slot["bone"]
 
-        # Spine checks clip-end BEFORE rendering — emit marker even for empty slots
-        if slot_name in pending_clip_ends:
-            draw_list.append({"type": "clip_end_marker", "slot_name": slot_name})
-            pending_clip_ends.discard(slot_name)
-
         state = slot_states.get(slot_name) if slot_states else None
 
         if state and "attachment" in state:
             att_name = state["attachment"]
             if att_name is None:
+                if slot_name in pending_clip_ends:
+                    draw_list.append({"type": "clip_end_marker",
+                                      "slot_name": slot_name})
+                    pending_clip_ends.discard(slot_name)
                 continue  # Slot hidden by animation
         else:
             att_name = slot.get("attachment")
             if att_name is None:
+                if slot_name in pending_clip_ends:
+                    draw_list.append({"type": "clip_end_marker",
+                                      "slot_name": slot_name})
+                    pending_clip_ends.discard(slot_name)
                 continue  # No attachment in setup pose — slot is empty
 
         # Resolve slot color: animation overrides setup pose
@@ -1257,6 +1289,10 @@ def build_draw_list(
 
         # Handle clipping attachments
         if att_type == "clipping":
+            if slot_name in pending_clip_ends:
+                draw_list.append({"type": "clip_end_marker",
+                                  "slot_name": slot_name})
+                pending_clip_ends.discard(slot_name)
             setup_verts = att_data.get("vertices", [])
             deform_key = (slot_name, att_name)
             if deform_states and deform_key in deform_states:
@@ -1301,14 +1337,26 @@ def build_draw_list(
                 "color": color,
                 "blend": blend,
             })
+            if slot_name in pending_clip_ends:
+                draw_list.append({"type": "clip_end_marker",
+                                  "slot_name": slot_name})
+                pending_clip_ends.discard(slot_name)
             continue
 
         if att_type is not None and att_type != "region":
+            if slot_name in pending_clip_ends:
+                draw_list.append({"type": "clip_end_marker",
+                                  "slot_name": slot_name})
+                pending_clip_ends.discard(slot_name)
             continue
 
         image_key = attachment_image_key(att_name, att_data)
         pixmap = textures.get(image_key)
         if pixmap is None:
+            if slot_name in pending_clip_ends:
+                draw_list.append({"type": "clip_end_marker",
+                                  "slot_name": slot_name})
+                pending_clip_ends.discard(slot_name)
             continue
 
         draw_list.append({
@@ -1320,6 +1368,12 @@ def build_draw_list(
             "color": color,
             "blend": blend,
         })
+        if slot_name in pending_clip_ends and clip_end_marker_after_slot(
+            att_name, att_data,
+        ):
+            draw_list.append({"type": "clip_end_marker",
+                              "slot_name": slot_name})
+            pending_clip_ends.discard(slot_name)
 
     return draw_list
 
