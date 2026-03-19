@@ -17,7 +17,7 @@ except ImportError:  # pragma: no cover - exercised in app fallback mode
 
 
 DEFAULT_TOLERANCE = 6
-DEFAULT_THRESHOLD_PERCENT = 0.15
+DEFAULT_THRESHOLD_PERCENT = 1.0
 
 
 def threshold_percent_to_ratio(percent: float) -> float:

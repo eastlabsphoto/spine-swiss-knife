@@ -16,13 +16,13 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QSpinBox,
     QDoubleSpinBox,
     QTabWidget, QTreeWidget, QTreeWidgetItem, QHeaderView, QMessageBox,
-    QTextEdit, QApplication,
+    QTextEdit, QApplication, QDialog, QSlider, QComboBox,
 )
 from PySide6.QtGui import (
     QFont, QTextCharFormat, QColor, QTextCursor,
     QImage, QPainter, QTransform, QPainterPath, QPolygonF,
 )
-from PySide6.QtCore import QPointF, Qt
+from PySide6.QtCore import QPointF, Qt, Signal
 
 from .i18n import tr, language_changed
 from . import draw_order_core
@@ -40,6 +40,7 @@ from .spine_viewer import (
     BoneTransform, solve_world_transforms, AnimationState,
     _evaluate_draw_order, solve_ik_constraints,
     build_draw_list, _affine_from_triangles, load_atlas_textures,
+    SpineGLCanvas,
 )
 
 np = draw_order_core.np
@@ -1082,6 +1083,251 @@ def optimize_draw_order(spine_data, fps=60, tolerance=5,
 
 
 # ---------------------------------------------------------------------------
+# Compare Dialog — side-by-side original vs optimized viewer
+# ---------------------------------------------------------------------------
+
+class CompareDialog(QDialog):
+    """Side-by-side viewer comparing original vs optimized draw order."""
+
+    accepted_result = Signal(bool)
+
+    def __init__(self, spine_data_original, spine_data_optimized,
+                 textures, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Draw Order Comparison")
+        self.setModal(True)
+
+        # Size to 80% of screen or 1200x700, whichever is smaller
+        screen = QApplication.primaryScreen()
+        if screen:
+            geom = screen.availableGeometry()
+            w = min(1200, int(geom.width() * 0.8))
+            h = min(700, int(geom.height() * 0.8))
+            self.resize(w, h)
+        else:
+            self.resize(1200, 700)
+
+        self._spine_original = spine_data_original
+        self._spine_optimized = spine_data_optimized
+        self._textures = textures
+        self._syncing_zoom = False
+
+        orig_groups = count_blend_groups(
+            spine_data_original.get("slots", []))
+        opt_groups = count_blend_groups(
+            spine_data_optimized.get("slots", []))
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(4)
+
+        # ── Top control bar ──────────────────────────────────────────
+        ctrl = QHBoxLayout()
+        ctrl.setSpacing(6)
+
+        ctrl.addWidget(QLabel("Animation:"))
+        self._anim_combo = QComboBox()
+        self._anim_combo.addItem("Setup Pose")
+        for name in spine_data_original.get("animations", {}).keys():
+            self._anim_combo.addItem(name)
+        self._anim_combo.currentIndexChanged.connect(self._on_anim_changed)
+        ctrl.addWidget(self._anim_combo)
+
+        self._play_btn = QPushButton("\u25b6  Play")
+        self._play_btn.setFixedWidth(80)
+        self._play_btn.clicked.connect(self._toggle_play)
+        ctrl.addWidget(self._play_btn)
+
+        ctrl.addWidget(QLabel("Speed:"))
+        self._speed_slider = QSlider(Qt.Horizontal)
+        self._speed_slider.setRange(1, 30)  # 0.1x to 3.0x
+        self._speed_slider.setValue(10)      # 1.0x
+        self._speed_slider.setFixedWidth(100)
+        self._speed_slider.valueChanged.connect(self._on_speed_changed)
+        ctrl.addWidget(self._speed_slider)
+        self._speed_label = QLabel("1.0x")
+        self._speed_label.setFixedWidth(35)
+        ctrl.addWidget(self._speed_label)
+
+        ctrl.addWidget(QLabel("Zoom:"))
+        self._zoom_slider = QSlider(Qt.Horizontal)
+        self._zoom_slider.setRange(5, 2000)  # 0.05 to 20.0
+        self._zoom_slider.setValue(100)       # 1.0
+        self._zoom_slider.setFixedWidth(100)
+        self._zoom_slider.valueChanged.connect(self._on_zoom_slider_changed)
+        ctrl.addWidget(self._zoom_slider)
+        self._zoom_label = QLabel("1.0")
+        self._zoom_label.setFixedWidth(30)
+        ctrl.addWidget(self._zoom_label)
+
+        ctrl.addStretch()
+        root.addLayout(ctrl)
+
+        # ── Canvas area ──────────────────────────────────────────────
+        canvas_row = QHBoxLayout()
+        canvas_row.setSpacing(4)
+
+        # Left side: original
+        left_col = QVBoxLayout()
+        self._left_label = QLabel(
+            f"Original ({orig_groups} groups)")
+        self._left_label.setAlignment(Qt.AlignCenter)
+        self._left_label.setStyleSheet("font-weight: bold; color: #e8a838;")
+        left_col.addWidget(self._left_label)
+
+        self._left_canvas = SpineGLCanvas()
+        self._left_canvas.set_base_data(spine_data_original, textures)
+        self._left_canvas.show_setup_pose()
+        left_col.addWidget(self._left_canvas, 1)
+        canvas_row.addLayout(left_col, 1)
+
+        # Right side: optimized
+        right_col = QVBoxLayout()
+        self._right_label = QLabel(
+            f"Optimized ({opt_groups} groups)")
+        self._right_label.setAlignment(Qt.AlignCenter)
+        self._right_label.setStyleSheet("font-weight: bold; color: #6ec072;")
+        right_col.addWidget(self._right_label)
+
+        self._right_canvas = SpineGLCanvas()
+        self._right_canvas.set_base_data(spine_data_optimized, textures)
+        self._right_canvas.show_setup_pose()
+        right_col.addWidget(self._right_canvas, 1)
+        canvas_row.addLayout(right_col, 1)
+
+        root.addLayout(canvas_row, 1)
+
+        # ── Timeline scrubber ────────────────────────────────────────
+        scrub_row = QHBoxLayout()
+        self._timeline = QSlider(Qt.Horizontal)
+        self._timeline.setRange(0, 1000)
+        self._timeline.setValue(0)
+        self._timeline.sliderMoved.connect(self._on_scrub)
+        scrub_row.addWidget(self._timeline, 1)
+        self._time_label = QLabel("0.00s / 0.00s")
+        self._time_label.setFixedWidth(120)
+        scrub_row.addWidget(self._time_label)
+        root.addLayout(scrub_row)
+
+        # ── Bottom buttons ───────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+
+        self._discard_btn = QPushButton("Discard")
+        self._discard_btn.clicked.connect(self.reject)
+        btn_row.addWidget(self._discard_btn)
+
+        self._accept_btn = QPushButton("Use Optimized")
+        self._accept_btn.setProperty("role", "primary")
+        self._accept_btn.clicked.connect(self.accept)
+        btn_row.addWidget(self._accept_btn)
+        root.addLayout(btn_row)
+
+        # ── Signal connections ───────────────────────────────────────
+        self._left_canvas.time_updated.connect(self._on_time_update)
+        self._left_canvas.zoom_changed.connect(
+            lambda z: self._sync_zoom(z, self._right_canvas))
+        self._right_canvas.zoom_changed.connect(
+            lambda z: self._sync_zoom(z, self._left_canvas))
+
+    # ── Slots ────────────────────────────────────────────────────────
+
+    def _on_anim_changed(self, index):
+        if index <= 0:
+            # Setup Pose
+            self._left_canvas.stop_animation()
+            self._right_canvas.stop_animation()
+            self._left_canvas.show_setup_pose()
+            self._right_canvas.show_setup_pose()
+            self._play_btn.setText("\u25b6  Play")
+            self._timeline.setValue(0)
+            self._timeline.setRange(0, 1000)
+            self._time_label.setText("0.00s / 0.00s")
+            return
+
+        anim_name = self._anim_combo.currentText()
+        anims_orig = self._spine_original.get("animations", {})
+        anims_opt = self._spine_optimized.get("animations", {})
+        anim_orig = anims_orig.get(anim_name)
+        anim_opt = anims_opt.get(anim_name)
+
+        if anim_orig:
+            self._left_canvas.play_animation(
+                self._spine_original, anim_orig)
+        if anim_opt:
+            self._right_canvas.play_animation(
+                self._spine_optimized, anim_opt)
+
+        self._play_btn.setText("\u23f8  Pause")
+
+        # Set timeline range from left canvas duration
+        t = self._left_canvas._track
+        if t["state"]:
+            dur_ms = int(t["state"].duration * 1000)
+            self._timeline.setRange(0, max(dur_ms, 1))
+
+    def _toggle_play(self):
+        t = self._left_canvas._track
+        if t["state"] is None:
+            return
+        if t["playing"]:
+            self._left_canvas.pause()
+            self._right_canvas.pause()
+            self._play_btn.setText("\u25b6  Play")
+        else:
+            self._left_canvas.resume()
+            self._right_canvas.resume()
+            self._play_btn.setText("\u23f8  Pause")
+
+    def _on_speed_changed(self, value):
+        speed = value / 10.0
+        self._left_canvas.set_speed(speed)
+        self._right_canvas.set_speed(speed)
+        self._speed_label.setText(f"{speed:.1f}x")
+
+    def _on_zoom_slider_changed(self, value):
+        if self._syncing_zoom:
+            return
+        zoom = value / 100.0
+        self._syncing_zoom = True
+        self._left_canvas._zoom = zoom
+        self._left_canvas.update()
+        self._right_canvas._zoom = zoom
+        self._right_canvas.update()
+        self._zoom_label.setText(
+            f"{zoom:.1f}" if zoom < 10 else f"{zoom:.0f}")
+        self._syncing_zoom = False
+
+    def _sync_zoom(self, zoom, target):
+        if self._syncing_zoom:
+            return
+        self._syncing_zoom = True
+        target._zoom = zoom
+        target.update()
+        self._zoom_slider.blockSignals(True)
+        self._zoom_slider.setValue(int(zoom * 100))
+        self._zoom_slider.blockSignals(False)
+        self._zoom_label.setText(
+            f"{zoom:.1f}" if zoom < 10 else f"{zoom:.0f}")
+        self._syncing_zoom = False
+
+    def _on_time_update(self, current_time, duration):
+        self._timeline.blockSignals(True)
+        self._timeline.setMaximum(int(duration * 1000))
+        self._timeline.setValue(int(current_time * 1000))
+        self._timeline.blockSignals(False)
+        self._time_label.setText(
+            f"{current_time:.2f}s / {duration:.2f}s")
+        # Sync right canvas to same time
+        self._right_canvas.seek(current_time)
+
+    def _on_scrub(self, value):
+        t = value / 1000.0
+        self._left_canvas.seek(t)
+        self._right_canvas.seek(t)
+
+
+# ---------------------------------------------------------------------------
 # UI Tab
 # ---------------------------------------------------------------------------
 
@@ -1347,42 +1593,59 @@ class DrawOrderOptimizerTab:
             final_groups = result["optimized_groups"]
 
             if final_groups < orig_groups:
-                # Save with backup
-                import shutil
-                try:
-                    if create_backup:
-                        shutil.copy2(json_path, backup_path)
-                    save_spine_json(json_path, modified)
-                except Exception as e:
-                    QMessageBox.critical(None, tr("err.title"),
-                                         tr("err.save_json", error=e))
-                    self._optimize_btn.setEnabled(True)
-                    return
-
-                self._log_line(
-                    tr("draw_order.done",
-                       orig=orig_groups,
-                       final=final_groups,
-                       moved=len(result.get("moved_slots", [])),
-                       skipped=len(result.get("unmovable_slots", [])),
-                       backup=backup_path),
-                    "#6ec072",
-                )
-
-                QMessageBox.information(
-                    None, tr("done.title"),
-                    tr("draw_order.done",
-                       orig=orig_groups,
-                       final=final_groups,
-                       moved=len(result.get("moved_slots", [])),
-                       skipped=len(result.get("unmovable_slots", [])),
-                       backup=backup_path),
-                )
-
-                if self._on_modified:
-                    self._on_modified()
+                # Show comparison dialog if textures are available
+                if textures:
+                    dialog = CompareDialog(
+                        spine_data, modified, textures, parent=None)
+                    accepted = dialog.exec() == QDialog.Accepted
                 else:
-                    self._analyze()
+                    # No textures — fall back to confirmation message box
+                    accepted = QMessageBox.question(
+                        None, "Apply Optimization?",
+                        f"Reduced {orig_groups} \u2192 {final_groups} groups.\n"
+                        "No atlas loaded for visual comparison.\n\n"
+                        "Apply the optimized draw order?",
+                    ) == QMessageBox.Yes
+
+                if accepted:
+                    # Save with backup
+                    import shutil
+                    try:
+                        if create_backup:
+                            shutil.copy2(json_path, backup_path)
+                        save_spine_json(json_path, modified)
+                    except Exception as e:
+                        QMessageBox.critical(None, tr("err.title"),
+                                             tr("err.save_json", error=e))
+                        self._optimize_btn.setEnabled(True)
+                        return
+
+                    self._log_line(
+                        tr("draw_order.done",
+                           orig=orig_groups,
+                           final=final_groups,
+                           moved=len(result.get("moved_slots", [])),
+                           skipped=len(result.get("unmovable_slots", [])),
+                           backup=backup_path),
+                        "#6ec072",
+                    )
+
+                    QMessageBox.information(
+                        None, tr("done.title"),
+                        tr("draw_order.done",
+                           orig=orig_groups,
+                           final=final_groups,
+                           moved=len(result.get("moved_slots", [])),
+                           skipped=len(result.get("unmovable_slots", [])),
+                           backup=backup_path),
+                    )
+
+                    if self._on_modified:
+                        self._on_modified()
+                    else:
+                        self._analyze()
+                else:
+                    self._log_line("Discarded optimization.", "#e8a838")
             else:
                 self._log_line("No improvement possible.", "#e8a838")
         else:

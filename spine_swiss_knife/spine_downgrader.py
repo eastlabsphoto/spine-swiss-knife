@@ -519,14 +519,22 @@ class SpineVersionConverterTab:
     def _convert_json_file(self, exe: str, path: str, target: str) -> str:
         """Convert .json → .json at target version.
 
-        Flow: import to temp .spine at target → export back to JSON.
+        Flow: patch JSON for target version → import to temp .spine
+        at target → export back to JSON.
         """
         tmp_dir = tempfile.mkdtemp(prefix="ssk_conv_")
         try:
-            # Step 1: import JSON → temp .spine at target version
+            # Step 0: patch JSON for target version compatibility
+            from .spine_json import load_spine_json, save_spine_json
+            data = load_spine_json(path)
+            data, _warnings = convert_to_destination(data, target)
+            patched_json = str(Path(tmp_dir) / "patched.json")
+            save_spine_json(patched_json, data)
+
+            # Step 1: import patched JSON → temp .spine at target version
             tmp_spine = str(Path(tmp_dir) / "temp.spine")
             result = import_to_spine_project(
-                exe, path, tmp_spine, target_version=target,
+                exe, patched_json, tmp_spine, target_version=target,
             )
             if not result.success:
                 raise RuntimeError(result.stderr or "Import failed")
