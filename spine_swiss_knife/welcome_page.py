@@ -213,35 +213,10 @@ class WelcomePage(QWidget):
         self._update_banner.show()
 
     def _do_update(self):
-        from .updater import UpdateWorker, restart_app
-
-        msg = tr("update.confirm",
-                 version=self._update_label.text(),
-                 changelog=self._pending_update_changelog or "—")
-        reply = QMessageBox.question(self, tr("confirm.title"), msg,
-                                     QMessageBox.Yes | QMessageBox.No)
-        if reply != QMessageBox.Yes:
-            return
-
-        self._update_btn.setEnabled(False)
-        self._update_label.setText(tr("update.downloading"))
-
-        self._update_worker = UpdateWorker(self._pending_update_url, self)
-        self._update_worker.progress.connect(
-            lambda text: self._update_label.setText(text))
-        self._update_worker.finished.connect(self._on_update_finished)
-        self._update_worker.failed.connect(self._on_update_failed)
-        self._update_worker.start()
-
-    def _on_update_finished(self):
-        from .updater import restart_app
-        self._update_label.setText(tr("update.restart"))
-        QApplication.processEvents()
-        restart_app()
-
-    def _on_update_failed(self, error: str):
-        self._update_btn.setEnabled(True)
-        self._update_label.setText(tr("update.failed", error=error))
+        import webbrowser
+        webbrowser.open(
+            "https://github.com/eastlabsphoto/spine-swiss-knife/releases/latest"
+        )
 
     # -- Retranslate --
 
