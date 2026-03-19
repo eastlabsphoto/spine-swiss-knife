@@ -19,7 +19,7 @@ a = Analysis(
         ('spine_swiss_knife/resources', 'spine_swiss_knife/resources'),
         ('GTSpineViewer_3653', 'GTSpineViewer_3653'),
     ],
-    hiddenimports=['certifi'],
+    hiddenimports=['certifi', 'numpy'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

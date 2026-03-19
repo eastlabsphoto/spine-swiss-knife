@@ -9,11 +9,12 @@ frames pixel-by-pixel.
 import copy
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QSpinBox,
+    QDoubleSpinBox,
     QTabWidget, QTreeWidget, QTreeWidgetItem, QHeaderView, QMessageBox,
     QTextEdit, QApplication,
 )
@@ -24,6 +25,16 @@ from PySide6.QtGui import (
 from PySide6.QtCore import QPointF, Qt
 
 from .i18n import tr, language_changed
+from . import draw_order_core
+from .draw_order_core import (
+    DEFAULT_THRESHOLD_PERCENT,
+    DEFAULT_TOLERANCE,
+    compute_optimal_order,
+    count_blend_groups,
+    iter_group_reducing_block_moves,
+    resolve_baseline_paths,
+    threshold_percent_to_ratio,
+)
 from .spine_json import load_spine_json, save_spine_json, normalize_skins
 from .spine_viewer import (
     BoneTransform, solve_world_transforms, AnimationState,
@@ -31,47 +42,8 @@ from .spine_viewer import (
     build_draw_list, _affine_from_triangles, load_atlas_textures,
 )
 
-try:
-    import numpy as np
-    HAS_NUMPY = True
-except ImportError:
-    HAS_NUMPY = False
-
-
-# ==========================================================================
-# Analysis helpers
-# ==========================================================================
-
-def count_blend_groups(slots: list[dict]) -> int:
-    """Count contiguous blend-mode groups (~ draw calls)."""
-    if not slots:
-        return 0
-    groups = 1
-    prev = slots[0].get("blend", "normal")
-    for slot in slots[1:]:
-        cur = slot.get("blend", "normal")
-        if cur != prev:
-            groups += 1
-            prev = cur
-    return groups
-
-
-def compute_optimal_order(slots: list[dict]) -> list[dict]:
-    """Stable-partition: normal slots first, then non-normal.
-
-    Preserves relative order within each group so that z-order among
-    same-blend slots is unchanged.  Non-normal slots are further grouped
-    by their specific blend mode (additive, multiply, screen).
-    """
-    groups: dict[str, list[dict]] = {}
-    for s in slots:
-        blend = s.get("blend", "normal")
-        groups.setdefault(blend, []).append(s)
-    # Normal first, then each non-normal blend grouped together
-    result = groups.pop("normal", [])
-    for blend in sorted(groups):
-        result.extend(groups[blend])
-    return result
+np = draw_order_core.np
+HAS_NUMPY = draw_order_core.HAS_NUMPY
 
 
 def has_draw_order_timelines(spine_data: dict) -> bool:
@@ -86,7 +58,8 @@ def analyze_draw_order(spine_data: dict) -> dict:
     """Full draw-order analysis for the UI."""
     slots = spine_data.get("slots", [])
     current_groups = count_blend_groups(slots)
-    optimal = compute_optimal_order(slots)
+    skins = normalize_skins(spine_data.get("skins", {}))
+    optimal = _optimize_zones(_split_into_zones(slots, skins))
     optimal_groups = count_blend_groups(optimal)
 
     # Build per-group breakdown
@@ -406,52 +379,6 @@ def _numpy_to_qimage(arr):
                   QImage.Format_ARGB32_Premultiplied).copy()
 
 
-def _spine_blend(dst, src, mode):
-    """Blend *src* onto *dst* (both float32 RGBA, **premultiplied alpha**).
-
-    QImage stores premultiplied RGB. These formulas match Qt's
-    CompositionMode exactly, producing zero noise vs QPainter.
-    """
-    sa = src[:, :, 3:4]
-    s_rgb = src[:, :, :3]
-    d_rgb = dst[:, :, :3]
-    d_a = dst[:, :, 3:4]
-
-    if mode == "normal":
-        # Porter-Duff SourceOver (premultiplied)
-        out_rgb = s_rgb + d_rgb * (1.0 - sa)
-        out_a = sa + d_a * (1.0 - sa)
-    elif mode == "additive":
-        # Plus (premultiplied): just add — src already has alpha baked in
-        out_rgb = np.minimum(s_rgb + d_rgb, 1.0)
-        out_a = np.minimum(sa + d_a, 1.0)
-    elif mode == "multiply":
-        # Un-premultiply for multiply math, then blend
-        d_a_safe = np.where(d_a > 0, d_a, 1.0)
-        s_a_safe = np.where(sa > 0, sa, 1.0)
-        d_straight = d_rgb / d_a_safe
-        s_straight = s_rgb / s_a_safe
-        blended = s_straight * d_straight
-        out_rgb = blended * sa * d_a + d_rgb * (1.0 - sa)
-        out_a = sa + d_a * (1.0 - sa)
-    elif mode == "screen":
-        d_a_safe = np.where(d_a > 0, d_a, 1.0)
-        s_a_safe = np.where(sa > 0, sa, 1.0)
-        d_straight = d_rgb / d_a_safe
-        s_straight = s_rgb / s_a_safe
-        blended = s_straight + d_straight - s_straight * d_straight
-        out_rgb = blended * sa * d_a + d_rgb * (1.0 - sa)
-        out_a = sa + d_a * (1.0 - sa)
-    else:
-        out_rgb = s_rgb + d_rgb * (1.0 - sa)
-        out_a = sa + d_a * (1.0 - sa)
-
-    result = dst.copy()
-    result[:, :, :3] = np.clip(out_rgb, 0.0, 1.0)
-    result[:, :, 3:4] = np.clip(out_a, 0.0, 1.0)
-    return result
-
-
 def _render_item(painter, item, world_transforms, cx, cy, zoom,
                  clip_end, active_clip_path):
     """Render a single draw-list item with *painter* using normal compositing.
@@ -617,10 +544,6 @@ def render_frame(
 
     When *bbox* is (x, y, w, h) in Spine world coords, uses that as
     the viewport. Otherwise uses a square canvas centered at origin.
-
-    Groups consecutive draw-list items by blend mode so that only one
-    QImage-to-numpy round-trip is needed per blend group (instead of
-    per slot).
     """
     draw_list = build_draw_list(
         spine_data, world_transforms, textures,
@@ -643,83 +566,27 @@ def render_frame(
         cy = canvas_size / 2.0
         zoom = 1.0
 
-    # ------------------------------------------------------------------
-    # Group consecutive items by blend mode.
-    # Clip / clip_end_marker items are folded into the current group so
-    # clipping state travels with the slots they affect.
-    # ------------------------------------------------------------------
-    groups = []  # [(blend_mode, [items]), ...]
-    for item in draw_list:
-        item_type = item.get("type")
-        if item_type in ("clip", "clip_end_marker"):
-            if groups:
-                groups[-1][1].append(item)
-            else:
-                groups.append(("normal", [item]))
-            continue
-        blend = item.get("blend", "normal")
-        if groups and groups[-1][0] == blend:
-            groups[-1][1].append(item)
-        else:
-            groups.append((blend, [item]))
-
-    # ------------------------------------------------------------------
-    # Fallback: no numpy available — render everything with QPainter,
-    # using QPainter composition modes for non-normal blends.
-    # ------------------------------------------------------------------
-    if not HAS_NUMPY:
-        image = QImage(img_w, img_h, QImage.Format_ARGB32_Premultiplied)
-        image.fill(Qt.transparent)
-        painter = QPainter(image)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.setRenderHint(QPainter.SmoothPixmapTransform)
-        clip_end = ""
-        active_clip_path = None
-        for item in draw_list:
-            item_type = item.get("type")
-            blend_name = item.get("blend", "normal")
-            # Set QPainter composition mode for non-normal blends
-            qp_blend = _BLEND_MODES.get(blend_name)
-            if qp_blend is not None:
-                painter.setCompositionMode(qp_blend)
-            clip_end, active_clip_path = _render_item(
-                painter, item, world_transforms, cx, cy, zoom,
-                clip_end, active_clip_path)
-            if qp_blend is not None:
-                painter.setCompositionMode(
-                    QPainter.CompositionMode_SourceOver)
-        painter.end()
-        return image
-
-    # ------------------------------------------------------------------
-    # Numpy path: render blend-mode groups, one temp image per group.
-    # ------------------------------------------------------------------
-    canvas = np.zeros((img_h, img_w, 4), dtype=np.float32)
+    image = QImage(img_w, img_h, QImage.Format_ARGB32_Premultiplied)
+    image.fill(Qt.transparent)
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setRenderHint(QPainter.SmoothPixmapTransform)
     clip_end = ""
     active_clip_path = None
 
-    for blend_mode, items in groups:
-        temp = QImage(img_w, img_h, QImage.Format_ARGB32_Premultiplied)
-        temp.fill(Qt.transparent)
-        painter = QPainter(temp)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+    for item in draw_list:
+        blend_name = item.get("blend", "normal")
+        qp_blend = _BLEND_MODES.get(blend_name)
+        if qp_blend is not None:
+            painter.setCompositionMode(qp_blend)
+        clip_end, active_clip_path = _render_item(
+            painter, item, world_transforms, cx, cy, zoom,
+            clip_end, active_clip_path)
+        if qp_blend is not None:
+            painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
 
-        # Restore active clip state from previous groups
-        if clip_end and active_clip_path is not None:
-            painter.resetTransform()
-            painter.setClipPath(active_clip_path)
-
-        for item in items:
-            clip_end, active_clip_path = _render_item(
-                painter, item, world_transforms, cx, cy, zoom,
-                clip_end, active_clip_path)
-        painter.end()
-
-        temp_arr = _qimage_to_numpy(temp)
-        canvas = _spine_blend(canvas, temp_arr, blend_mode)
-
-    return _numpy_to_qimage(canvas)
+    painter.end()
+    return image
 
 
 def render_animation_sequence(spine_data, textures, slot_order, anim_name,
@@ -764,6 +631,9 @@ def render_animation_sequence(spine_data, textures, slot_order, anim_name,
         os.makedirs(anim_dir, exist_ok=True)
 
     for fi in range(frame_count):
+        if fi % 5 == 0:
+            QApplication.processEvents()
+
         t = fi / fps
         if t > duration:
             t = duration
@@ -816,17 +686,14 @@ def _qimages_match(img_a, img_b, tolerance=5, threshold=0.02,
             return img_a == img_b
         arr_a = np.frombuffer(bytes(ptr_a), dtype=np.uint8).reshape(h, w, 4)
         arr_b = np.frombuffer(bytes(ptr_b), dtype=np.uint8).reshape(h, w, 4)
-        diff = np.abs(arr_a.astype(np.int16) - arr_b.astype(np.int16))
-        pixel_max = diff.max(axis=2)
-        max_val = int(pixel_max.max()) if pixel_max.size > 0 else 0
-        bad = np.count_nonzero(pixel_max > tolerance)
-        total = w * h
-        pct = bad / total * 100 if total > 0 else 0
-        match = bad / total < threshold if total > 0 else True
+        match, stats = draw_order_core.compare_rgba_arrays(
+            arr_a, arr_b, tolerance=tolerance, threshold=threshold)
         if not match and _log_diffs is not None:
             _log_diffs.append(
-                f"max_diff={max_val}, bad_pixels={bad} "
-                f"({pct:.2f}%), tolerance={tolerance}")
+                f"max_diff={stats['max_diff']}, "
+                f"bad_pixels={stats['bad_pixels']} of "
+                f"{stats['visible_pixels']} visible "
+                f"({stats['pct_bad']:.2f}%), tolerance={tolerance}")
         return match
 
     # Fallback: exact comparison only
@@ -927,14 +794,11 @@ def _try_individual_moves(
     zone_start, zone_end, anim_names, fps, bbox, tolerance,
     threshold=0.02, on_log=None, debug_dir=None, _depth=0,
 ):
-    """Try moving individual minority-blend slots within a small range.
+    """Try local run moves within a small range.
 
-    For each slot whose blend mode differs from its neighbors, try
-    moving it to the nearest group of the same blend mode.  This
-    handles "sandwich" cases like [A, N, A] where moving the single
-    N out joins the two A groups.
-
-    Returns number of blend groups saved.
+    Generates candidates by moving whole contiguous blend runs to new
+    positions inside the current sub-range. This covers single-slot
+    sandwich cases and two-slot runs that the older heuristic missed.
     """
     indent = "    " + "  " * _depth
     total_saved = 0
@@ -943,73 +807,31 @@ def _try_individual_moves(
     while changed:
         changed = False
         sub = full_slots[zone_start:zone_end]
+        old_g = count_blend_groups(full_slots)
 
-        # Find minority slots: slots whose blend differs from both
-        # neighbors (or from the dominant blend in the range)
-        for i in range(len(sub)):
-            slot = sub[i]
-            blend = slot.get("blend", "normal")
-            abs_i = zone_start + i
-
-            # Check if this slot breaks a group
-            prev_blend = sub[i - 1].get("blend", "normal") if i > 0 else None
-            next_blend = sub[i + 1].get("blend", "normal") if i + 1 < len(sub) else None
-
-            # Sandwich: surrounded by different blend on both sides
-            is_sandwich = (prev_blend is not None and
-                           next_blend is not None and
-                           prev_blend != blend and
-                           next_blend != blend and
-                           prev_blend == next_blend)
-
-            # Edge break: at boundary, different from neighbor
-            is_edge_break = ((prev_blend is not None and
-                              prev_blend != blend and
-                              next_blend == blend) or
-                             (next_blend is not None and
-                              next_blend != blend and
-                              prev_blend == blend))
-
-            if not is_sandwich and not is_edge_break:
-                continue
-
-            # Find nearest same-blend neighbor to move next to
-            # (search outward from current position)
-            best_candidate = None
-            for direction in (-1, 1):  # Try left first, then right
-                candidate_sub = list(sub)
-                moved = candidate_sub.pop(i)
-                # Find nearest same-blend slot in this direction
-                insert_pos = i if direction == 1 else i - 1
-                while 0 <= insert_pos <= len(candidate_sub):
-                    if insert_pos < len(candidate_sub):
-                        nb = candidate_sub[insert_pos].get("blend", "normal")
-                        if nb == blend:
-                            # Insert next to this same-blend neighbor
-                            pos = insert_pos + 1 if direction == 1 else insert_pos
-                            candidate_sub.insert(pos, moved)
-                            break
-                    insert_pos += direction
-                else:
-                    continue
-
-                cand = (full_slots[:zone_start] +
-                        candidate_sub +
-                        full_slots[zone_end:])
-
-                if count_blend_groups(cand) < count_blend_groups(full_slots):
-                    best_candidate = cand
-                    break
-
-            if best_candidate is None:
-                continue
-            candidate = best_candidate
-
-            old_g = count_blend_groups(full_slots)
+        for candidate_sub in iter_group_reducing_block_moves(sub):
+            candidate = (
+                full_slots[:zone_start] +
+                candidate_sub +
+                full_slots[zone_end:]
+            )
             new_g = count_blend_groups(candidate)
+            if new_g >= old_g:
+                continue
+
+            after_names = [slot["name"] for slot in candidate_sub]
+            new_positions = {name: idx for idx, name in enumerate(after_names)}
+            moved_names = [
+                name for name, old_idx in
+                {slot["name"]: idx for idx, slot in enumerate(sub)}.items()
+                if new_positions.get(name) != old_idx
+            ]
+            label = ", ".join(moved_names[:3]) if moved_names else "local run"
+            if len(moved_names) > 3:
+                label += ", ..."
 
             if on_log:
-                on_log(f"{indent}  Try moving '{slot['name']}' "
+                on_log(f"{indent}  Try moving {label} "
                        f"({old_g} \u2192 {new_g})...")
 
             ok, _ = _compare_with_original(
@@ -1019,15 +841,14 @@ def _try_individual_moves(
 
             if ok:
                 if on_log:
-                    on_log(f"{indent}  \u2714 '{slot['name']}' safe")
+                    on_log(f"{indent}  \u2714 {label} safe")
                 full_slots[:] = candidate
                 total_saved += old_g - new_g
                 changed = True
                 break  # Restart scan with new slot order
             else:
                 if on_log:
-                    on_log(f"{indent}  \u2718 '{slot['name']}' "
-                           f"visual change")
+                    on_log(f"{indent}  \u2718 {label} visual change")
 
     return total_saved
 
@@ -1096,7 +917,7 @@ def _bisect_zone(
     # For small ranges, try moving individual slots instead of
     # full partition — this can rescue slots like cloud_normal
     # sandwiched between additive groups.
-    if length <= 10:
+    if length <= 12:
         saved = _try_individual_moves(
             spine_data, textures, original_images, full_slots,
             zone_start, zone_end, anim_names, fps, bbox,
@@ -1124,7 +945,7 @@ def _bisect_zone(
 
 def optimize_draw_order(spine_data, fps=30, tolerance=5,
                          threshold=0.02, textures=None, on_log=None,
-                         debug_dir=None):
+                         debug_dir=None, baseline_data=None):
     """Zone-based draw-order optimisation with QPainter verification.
 
     1. Render original once (cached).
@@ -1139,8 +960,10 @@ def optimize_draw_order(spine_data, fps=30, tolerance=5,
         if on_log:
             on_log(msg)
 
-    original_slots = spine_data.get("slots", [])
-    initial_groups = count_blend_groups(original_slots)
+    current_slots = spine_data.get("slots", [])
+    initial_groups = count_blend_groups(current_slots)
+    baseline_data = baseline_data or spine_data
+    baseline_slots = baseline_data.get("slots", [])
 
     if not textures:
         log("Atlas required for visual verification. "
@@ -1151,7 +974,7 @@ def optimize_draw_order(spine_data, fps=30, tolerance=5,
     skins = normalize_skins(spine_data.get("skins", {}))
 
     # Compute optimal order (zone-aware)
-    zones = _split_into_zones(original_slots, skins)
+    zones = _split_into_zones(current_slots, skins)
     optimized = _optimize_zones(zones)
     optimal_groups = count_blend_groups(optimized)
 
@@ -1169,7 +992,7 @@ def optimize_draw_order(spine_data, fps=30, tolerance=5,
         f"({sum(1 for z in zones if not z.is_boundary)} optimisable)")
 
     # Compute bounding box
-    bbox = _compute_skeleton_bbox(spine_data, textures)
+    bbox = _compute_skeleton_bbox(baseline_data, textures)
     bw, bh = int(bbox[2]), int(bbox[3])
     log(f"Render canvas: {bw}\u00d7{bh}px")
 
@@ -1179,7 +1002,7 @@ def optimize_draw_order(spine_data, fps=30, tolerance=5,
     # -- Step 1: Render original ONCE (in-memory only) --
     log("Rendering original...")
     original_images = _render_all_animations(
-        spine_data, textures, original_slots,
+        baseline_data, textures, baseline_slots,
         anim_names, fps, bbox)
     total_frames = sum(len(v) for v in original_images.values())
     log(f"  {total_frames} frames rendered.")
@@ -1199,7 +1022,7 @@ def optimize_draw_order(spine_data, fps=30, tolerance=5,
         return {"success": True, "modified_data": test_data,
                 "original_groups": initial_groups,
                 "optimized_groups": optimal_groups,
-                "moved_slots": _moved_names(original_slots, optimized),
+                "moved_slots": _moved_names(current_slots, optimized),
                 "unmovable_slots": [],
                 "message": f"Reduced {initial_groups} \u2192 {optimal_groups}"}
 
@@ -1208,7 +1031,7 @@ def optimize_draw_order(spine_data, fps=30, tolerance=5,
         f"{len(diffs)} animation(s). "
         f"Bisecting zones to find safe sub-ranges...")
 
-    working_slots = list(original_slots)
+    working_slots = list(current_slots)
     total_saved = 0
     pass_num = 0
     max_passes = 20
@@ -1253,7 +1076,7 @@ def optimize_draw_order(spine_data, fps=30, tolerance=5,
     return {"success": True, "modified_data": test_data,
             "original_groups": initial_groups,
             "optimized_groups": final_groups,
-            "moved_slots": _moved_names(original_slots, working_slots),
+            "moved_slots": _moved_names(current_slots, working_slots),
             "unmovable_slots": [],
             "message": f"Reduced {initial_groups} \u2192 {final_groups}"}
 
@@ -1307,24 +1130,26 @@ class DrawOrderOptimizerTab:
         btn_row.addWidget(QLabel(tr("draw_order.tolerance_label")))
         self._tolerance_spin = QSpinBox()
         self._tolerance_spin.setRange(0, 50)
-        self._tolerance_spin.setValue(15)
+        self._tolerance_spin.setValue(DEFAULT_TOLERANCE)
         self._tolerance_spin.setToolTip(
             "Per-pixel tolerance (0-255 per channel).\n"
             "If a pixel differs by less than this value,\n"
             "it is considered identical.\n"
-            "Default: 5")
+            f"Default: {DEFAULT_TOLERANCE}")
         btn_row.addWidget(self._tolerance_spin)
 
         btn_row.addWidget(QLabel("Threshold %:"))
-        self._threshold_spin = QSpinBox()
-        self._threshold_spin.setRange(1, 20)
-        self._threshold_spin.setValue(1)
+        self._threshold_spin = QDoubleSpinBox()
+        self._threshold_spin.setDecimals(2)
+        self._threshold_spin.setRange(0.01, 20.0)
+        self._threshold_spin.setSingleStep(0.05)
+        self._threshold_spin.setValue(DEFAULT_THRESHOLD_PERCENT)
         self._threshold_spin.setToolTip(
             "Max percentage of bad pixels allowed (0-100%).\n"
             "A pixel is 'bad' if it exceeds the tolerance.\n"
             "If fewer than this % of pixels are bad,\n"
             "the frame is considered matching.\n"
-            "Default: 2%")
+            f"Default: {DEFAULT_THRESHOLD_PERCENT}%")
         btn_row.addWidget(self._threshold_spin)
 
         from PySide6.QtWidgets import QCheckBox
@@ -1400,13 +1225,11 @@ class DrawOrderOptimizerTab:
                     item.setForeground(col, QColor("#e8a838"))
 
         cur = analysis["current_groups"]
-        opt = analysis["optimal_groups"]
         has_do = analysis["has_draw_order_timelines"]
 
         self._stats.setText(tr("draw_order.stats",
                                total=len(analysis["slots"]),
-                               current=cur,
-                               optimal=opt))
+                               current=cur))
 
         if has_do:
             self._log_line(tr("draw_order.warn_timelines"), "#e8a838")
@@ -1426,6 +1249,18 @@ class DrawOrderOptimizerTab:
                                  tr("err.parse_json", error=e))
             return
 
+        backup_exists = os.path.isfile(json_path + ".backup")
+        baseline_path, backup_path, create_backup = resolve_baseline_paths(
+            json_path, backup_exists=backup_exists)
+        baseline_data = spine_data
+        if baseline_path != json_path:
+            try:
+                baseline_data = load_spine_json(baseline_path)
+            except Exception as e:
+                QMessageBox.critical(None, tr("err.title"),
+                                     tr("err.parse_json", error=e))
+                return
+
         analysis = analyze_draw_order(spine_data)
         if not analysis["can_optimize"]:
             return
@@ -1433,8 +1268,7 @@ class DrawOrderOptimizerTab:
         if QMessageBox.question(
             None, tr("confirm.title"),
             tr("draw_order.confirm",
-               current=analysis["current_groups"],
-               optimal=analysis["optimal_groups"]),
+               current=analysis["current_groups"]),
         ) != QMessageBox.Yes:
             return
 
@@ -1453,6 +1287,21 @@ class DrawOrderOptimizerTab:
                 pass
         if not textures:
             self._log_line("No atlas \u2014 optimising without visual check.", "#e8a838")
+        elif HAS_NUMPY:
+            self._log_line(
+                "Verifier: QPainter render + tolerant numpy diff.",
+                "#6ec072",
+            )
+        else:
+            self._log_line(
+                "Verifier: QPainter fallback (exact pixel compare).",
+                "#e8a838",
+            )
+        if baseline_path != json_path:
+            self._log_line(
+                f"Baseline locked to original backup: {baseline_path}",
+                "#e8a838",
+            )
 
         # Debug dir for saving comparison PNGs
         debug_dir = None
@@ -1475,9 +1324,11 @@ class DrawOrderOptimizerTab:
                 spine_data,
                 fps=fps,
                 tolerance=tolerance,
-                threshold=self._threshold_spin.value() / 100.0,
+                threshold=threshold_percent_to_ratio(
+                    self._threshold_spin.value()),
                 textures=textures,
                 debug_dir=debug_dir,
+                baseline_data=baseline_data,
                 on_log=lambda msg: (
                     self._log_line(msg, "#6ec072"),
                     QApplication.processEvents(),
@@ -1498,9 +1349,9 @@ class DrawOrderOptimizerTab:
             if final_groups < orig_groups:
                 # Save with backup
                 import shutil
-                backup = json_path + ".backup"
                 try:
-                    shutil.copy2(json_path, backup)
+                    if create_backup:
+                        shutil.copy2(json_path, backup_path)
                     save_spine_json(json_path, modified)
                 except Exception as e:
                     QMessageBox.critical(None, tr("err.title"),
@@ -1514,7 +1365,7 @@ class DrawOrderOptimizerTab:
                        final=final_groups,
                        moved=len(result.get("moved_slots", [])),
                        skipped=len(result.get("unmovable_slots", [])),
-                       backup=backup),
+                       backup=backup_path),
                     "#6ec072",
                 )
 
@@ -1525,7 +1376,7 @@ class DrawOrderOptimizerTab:
                        final=final_groups,
                        moved=len(result.get("moved_slots", [])),
                        skipped=len(result.get("unmovable_slots", [])),
-                       backup=backup),
+                       backup=backup_path),
                 )
 
                 if self._on_modified:
