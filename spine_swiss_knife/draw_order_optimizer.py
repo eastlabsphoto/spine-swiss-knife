@@ -16,13 +16,13 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QSpinBox,
     QDoubleSpinBox,
     QTabWidget, QTreeWidget, QTreeWidgetItem, QHeaderView, QMessageBox,
-    QTextEdit, QApplication, QDialog, QSlider, QComboBox,
+    QTextEdit, QApplication, QDialog, QSlider, QComboBox, QStackedWidget,
 )
 from PySide6.QtGui import (
     QFont, QTextCharFormat, QColor, QTextCursor,
-    QImage, QPainter, QTransform, QPainterPath, QPolygonF,
+    QImage, QPainter, QTransform, QPainterPath, QPolygonF, QPen,
 )
-from PySide6.QtCore import QPointF, Qt, Signal
+from PySide6.QtCore import QPointF, Qt, Signal, QTimer
 
 from .i18n import tr, language_changed
 from . import draw_order_core
@@ -1083,6 +1083,94 @@ def optimize_draw_order(spine_data, fps=60, tolerance=5,
 
 
 # ---------------------------------------------------------------------------
+# Composite view for wipe / overlay modes
+# ---------------------------------------------------------------------------
+
+class _CompositeView(QWidget):
+    """Captures two GL canvases and composites them as wipe or overlay."""
+
+    def __init__(self, left_canvas, right_canvas, parent=None):
+        super().__init__(parent)
+        self._left = left_canvas
+        self._right = right_canvas
+        self._mode = "wipe"       # "wipe" or "overlay"
+        self._position = 0.5      # 0.0 = all original, 1.0 = all optimized
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self.update)
+
+    def set_mode(self, mode):
+        self._mode = mode
+
+    def set_position(self, pos):
+        self._position = max(0.0, min(1.0, pos))
+
+    def start(self):
+        if not self._timer.isActive():
+            self._timer.start(50)  # 20fps — balance quality/perf
+
+    def stop(self):
+        self._timer.stop()
+
+    def paintEvent(self, event):
+        w, h = self.width(), self.height()
+        if w < 2 or h < 2:
+            return
+
+        left_pm = self._left.grab()
+        right_pm = self._right.grab()
+
+        left_s = left_pm.scaled(w, h, Qt.KeepAspectRatio,
+                                Qt.SmoothTransformation)
+        right_s = right_pm.scaled(w, h, Qt.KeepAspectRatio,
+                                  Qt.SmoothTransformation)
+
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor("#2b2b2b"))
+
+        # Center scaled pixmaps
+        ox = (w - left_s.width()) // 2
+        oy = (h - left_s.height()) // 2
+
+        if self._mode == "wipe":
+            split_x = int(left_s.width() * self._position)
+            # Draw left (original) full
+            p.drawPixmap(ox, oy, left_s)
+            # Draw right (optimized) clipped to right side
+            p.setClipRect(ox + split_x, oy,
+                          left_s.width() - split_x, left_s.height())
+            p.drawPixmap(ox, oy, right_s)
+            p.setClipping(False)
+            # Split line
+            pen = QPen(QColor("#ffffff"), 2)
+            p.setPen(pen)
+            p.drawLine(ox + split_x, oy,
+                       ox + split_x, oy + left_s.height())
+            # Labels
+            p.setPen(QColor("#e8a838"))
+            p.drawText(ox + 8, oy + 18, "Original")
+            p.setPen(QColor("#6ec072"))
+            p.drawText(ox + split_x + 8, oy + 18, "Optimized")
+
+        elif self._mode == "overlay":
+            # Original at full opacity
+            p.drawPixmap(ox, oy, left_s)
+            # Optimized on top with slider opacity
+            p.setOpacity(self._position)
+            p.drawPixmap(ox, oy, right_s)
+            p.setOpacity(1.0)
+            # Labels
+            p.setPen(QColor("#e8a838"))
+            pct = int((1.0 - self._position) * 100)
+            p.drawText(ox + 8, oy + 18, f"Original {pct}%")
+            p.setPen(QColor("#6ec072"))
+            pct2 = int(self._position * 100)
+            p.drawText(ox + 8, oy + 34, f"Optimized {pct2}%")
+
+        p.end()
+
+
+# ---------------------------------------------------------------------------
 # Compare Dialog — side-by-side original vs optimized viewer
 # ---------------------------------------------------------------------------
 
@@ -1132,6 +1220,12 @@ class CompareDialog(QDialog):
             self._anim_combo.addItem(name)
         self._anim_combo.currentIndexChanged.connect(self._on_anim_changed)
         ctrl.addWidget(self._anim_combo)
+
+        ctrl.addWidget(QLabel("View:"))
+        self._view_combo = QComboBox()
+        self._view_combo.addItems(["Side by Side", "Wipe", "Overlay"])
+        self._view_combo.currentIndexChanged.connect(self._on_view_changed)
+        ctrl.addWidget(self._view_combo)
 
         self._play_btn = QPushButton("\u25b6  Play")
         self._play_btn.setFixedWidth(80)
@@ -1195,7 +1289,35 @@ class CompareDialog(QDialog):
         right_col.addWidget(self._right_canvas, 1)
         canvas_row.addLayout(right_col, 1)
 
-        root.addLayout(canvas_row, 1)
+        self._canvas_stack = QStackedWidget()
+        side_widget = QWidget()
+        side_widget.setLayout(canvas_row)
+        self._canvas_stack.addWidget(side_widget)
+
+        # Page 1: composite view (wipe / overlay)
+        self._composite = _CompositeView(
+            self._left_canvas, self._right_canvas)
+        self._canvas_stack.addWidget(self._composite)
+
+        root.addWidget(self._canvas_stack, 1)
+
+        # Blend slider (for wipe / overlay) — hidden by default
+        blend_row = QHBoxLayout()
+        self._blend_label = QLabel("Wipe:")
+        self._blend_label.setFixedWidth(55)
+        blend_row.addWidget(self._blend_label)
+        self._blend_slider = QSlider(Qt.Horizontal)
+        self._blend_slider.setRange(0, 100)
+        self._blend_slider.setValue(50)
+        self._blend_slider.valueChanged.connect(self._on_blend_changed)
+        blend_row.addWidget(self._blend_slider, 1)
+        self._blend_value_label = QLabel("50%")
+        self._blend_value_label.setFixedWidth(35)
+        blend_row.addWidget(self._blend_value_label)
+        root.addLayout(blend_row)
+        self._blend_label.hide()
+        self._blend_slider.hide()
+        self._blend_value_label.hide()
 
         # ── Timeline scrubber ────────────────────────────────────────
         scrub_row = QHBoxLayout()
@@ -1325,6 +1447,34 @@ class CompareDialog(QDialog):
         t = value / 1000.0
         self._left_canvas.seek(t)
         self._right_canvas.seek(t)
+
+    def _on_view_changed(self, index):
+        if index == 0:  # Side by Side
+            self._composite.stop()
+            self._canvas_stack.setCurrentIndex(0)
+            self._blend_label.hide()
+            self._blend_slider.hide()
+            self._blend_value_label.hide()
+        elif index == 1:  # Wipe
+            self._composite.set_mode("wipe")
+            self._blend_label.setText("Wipe:")
+            self._canvas_stack.setCurrentIndex(1)
+            self._composite.start()
+            self._blend_label.show()
+            self._blend_slider.show()
+            self._blend_value_label.show()
+        elif index == 2:  # Overlay
+            self._composite.set_mode("overlay")
+            self._blend_label.setText("Opacity:")
+            self._canvas_stack.setCurrentIndex(1)
+            self._composite.start()
+            self._blend_label.show()
+            self._blend_slider.show()
+            self._blend_value_label.show()
+
+    def _on_blend_changed(self, value):
+        self._composite.set_position(value / 100.0)
+        self._blend_value_label.setText(f"{value}%")
 
 
 # ---------------------------------------------------------------------------
