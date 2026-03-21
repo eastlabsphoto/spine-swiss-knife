@@ -275,6 +275,8 @@
   "draw_order.presplit.assign_btn": "Assign",
   "draw_order.presplit.clear_btn": "Clear",
   "draw_order.presplit.each_own_btn": "Each = own group",
+  "draw_order.presplit.auto_btn": "Auto",
+  "draw_order.presplit.auto_tip": "Automatically group animations by their visible slot sets — animations that use the same slots are placed in the same group",
   "draw_order.presplit.no_groups": "No groups assigned. Assign group numbers to animations first.",
   "draw_order.presplit.confirm": "Run pre-split optimisation with {count} group(s)?\n\n{summary}\n\nEach group will be optimised independently.",
   "draw_order.presplit.log.group": "── Group '{name}' ({count} animations) ──",

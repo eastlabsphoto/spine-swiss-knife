@@ -42,6 +42,72 @@ np = draw_order_core.np
 HAS_NUMPY = draw_order_core.HAS_NUMPY
 
 
+# ==========================================================================
+# Slot visibility per animation
+# ==========================================================================
+
+def compute_slot_visibility(spine_data: dict) -> dict:
+    """Compute which slots are visible (have attachment) in each animation.
+
+    Returns dict: ``{anim_name_or_None: frozenset_of_visible_slot_names}``.
+    ``None`` key = setup pose.
+    """
+    slots = spine_data.get("slots", [])
+    animations = spine_data.get("animations", {})
+
+    # Setup pose: slots with non-null attachment
+    setup_visible = set()
+    for s in slots:
+        if s.get("attachment") is not None:
+            setup_visible.add(s["name"])
+
+    result = {None: frozenset(setup_visible)}
+
+    for anim_name, anim_data in animations.items():
+        visible = set(setup_visible)
+
+        # Slots with attachment keyframes that set a non-null attachment
+        for slot_name, channels in anim_data.get("slots", {}).items():
+            if "attachment" in channels:
+                if any(kf.get("name") is not None
+                       for kf in channels["attachment"]):
+                    visible.add(slot_name)
+
+        # Slots referenced in drawOrder timelines
+        for entry in anim_data.get("drawOrder",
+                                    anim_data.get("draworder", [])):
+            for offset in entry.get("offsets", []):
+                if "slot" in offset:
+                    visible.add(offset["slot"])
+
+        result[anim_name] = frozenset(visible)
+
+    return result
+
+
+def auto_group_animations(spine_data: dict) -> dict[str, list[str]]:
+    """Automatically group animations by visible slot fingerprint.
+
+    Animations with identical visible slot sets are placed in the same
+    group — they impose the same draw-order constraints, so optimising
+    them together is equivalent to optimising each individually.
+    """
+    visibility = compute_slot_visibility(spine_data)
+
+    groups_by_key: dict[frozenset[str], list[str]] = {}
+    for anim_name, visible in visibility.items():
+        if anim_name is None:
+            continue
+        groups_by_key.setdefault(visible, []).append(anim_name)
+
+    result: dict[str, list[str]] = {}
+    for i, (_, anims) in enumerate(
+            sorted(groups_by_key.items(), key=lambda x: -len(x[1])), 1):
+        result[str(i)] = sorted(anims)
+
+    return result
+
+
 def has_draw_order_timelines(spine_data: dict) -> bool:
     """Check whether any animation has drawOrder keyframes."""
     for anim in spine_data.get("animations", {}).values():
@@ -194,6 +260,7 @@ def _try_individual_moves(
     spine_data, textures, original_images, full_slots,
     zone_start, zone_end, anim_names, fps, bbox, tolerance,
     threshold=0.02, on_log=None, debug_dir=None, _depth=0,
+    slot_visibility=None,
 ):
     """Try local run moves within a small range.
 
@@ -238,7 +305,9 @@ def _try_individual_moves(
             ok, _ = _compare_with_original(
                 spine_data, textures, original_images, candidate,
                 anim_names, fps, bbox, tolerance, threshold,
-                on_log=on_log, debug_dir=debug_dir)
+                on_log=on_log, debug_dir=debug_dir,
+                moved_slots=set(moved_names),
+                slot_visibility=slot_visibility)
 
             if ok:
                 if on_log:
@@ -258,6 +327,7 @@ def _bisect_zone(
     spine_data, textures, original_images, full_slots,
     zone_start, zone_end, anim_names, fps, bbox, tolerance,
     threshold=0.02, on_log=None, debug_dir=None, _depth=0,
+    slot_visibility=None,
 ):
     """Binary search on a sub-range of slots within a zone.
 
@@ -297,10 +367,12 @@ def _bisect_zone(
         on_log(f"{indent}Testing slots [{zone_start}:{zone_end}] "
                f"({length} slots, {old_groups} \u2192 {new_groups})...")
 
+    moved = set(_moved_names(sub_slots, optimized_sub))
     ok, _ = _compare_with_original(
         spine_data, textures, original_images, candidate,
         anim_names, fps, bbox, tolerance, threshold,
-        on_log=on_log, debug_dir=debug_dir)
+        on_log=on_log, debug_dir=debug_dir,
+        moved_slots=moved, slot_visibility=slot_visibility)
 
     if ok:
         if on_log:
@@ -322,7 +394,8 @@ def _bisect_zone(
         saved = _try_individual_moves(
             spine_data, textures, original_images, full_slots,
             zone_start, zone_end, anim_names, fps, bbox,
-            tolerance, threshold, on_log, debug_dir, _depth)
+            tolerance, threshold, on_log, debug_dir, _depth,
+            slot_visibility=slot_visibility)
         if saved > 0:
             return saved
 
@@ -336,11 +409,13 @@ def _bisect_zone(
     saved += _bisect_zone(
         spine_data, textures, original_images, full_slots,
         zone_start, mid, anim_names, fps, bbox, tolerance,
-        threshold, on_log, debug_dir, _depth + 1)
+        threshold, on_log, debug_dir, _depth + 1,
+        slot_visibility=slot_visibility)
     saved += _bisect_zone(
         spine_data, textures, original_images, full_slots,
         mid, zone_end, anim_names, fps, bbox, tolerance,
-        threshold, on_log, debug_dir, _depth + 1)
+        threshold, on_log, debug_dir, _depth + 1,
+        slot_visibility=slot_visibility)
     return saved
 
 
@@ -409,6 +484,9 @@ def optimize_draw_order(spine_data, fps=60, tolerance=5,
     else:
         anim_names = [None] + list(animations.keys())
 
+    # -- Slot visibility map for per-move filtering --
+    slot_vis = compute_slot_visibility(spine_data)
+
     # -- Step 1: Render original ONCE (in-memory only) --
     log("Rendering original...")
     original_images = _render_all_animations(
@@ -419,10 +497,12 @@ def optimize_draw_order(spine_data, fps=60, tolerance=5,
 
     # -- Step 2: Test full optimization --
     log("Testing full optimisation...")
+    moved = set(_moved_names(current_slots, optimized))
     ok, diffs = _compare_with_original(
         spine_data, textures, original_images, optimized,
         anim_names, fps, bbox, tolerance, threshold,
-        on_log=on_log, early_exit=False)
+        on_log=on_log, early_exit=False,
+        moved_slots=moved, slot_visibility=slot_vis)
 
     if ok:
         log(f"\u2714 Full optimisation safe! "
@@ -465,7 +545,8 @@ def optimize_draw_order(spine_data, fps=60, tolerance=5,
                     zone_offset + zone_len,
                     anim_names, fps, bbox, tolerance,
                     threshold, on_log=on_log,
-                    debug_dir=debug_dir)
+                    debug_dir=debug_dir,
+                    slot_visibility=slot_vis)
                 pass_saved += saved
             zone_offset += zone_len
 
@@ -498,8 +579,10 @@ def optimize_draw_order(spine_data, fps=60, tolerance=5,
 class PreSplitDialog(QDialog):
     """Assign animations to groups for per-group draw-order optimisation."""
 
-    def __init__(self, animation_names: list[str], parent=None):
+    def __init__(self, animation_names: list[str], spine_data=None,
+                 parent=None):
         super().__init__(parent)
+        self._spine_data = spine_data
         self.setWindowTitle(tr("draw_order.presplit.title"))
         self.resize(600, 500)
 
@@ -537,6 +620,12 @@ class PreSplitDialog(QDialog):
         each_btn = QPushButton(tr("draw_order.presplit.each_own_btn"))
         each_btn.clicked.connect(self._each_own_group)
         assign_row.addWidget(each_btn)
+        auto_btn = QPushButton(tr("draw_order.presplit.auto_btn"))
+        auto_btn.setToolTip(tr("draw_order.presplit.auto_tip"))
+        auto_btn.clicked.connect(self._auto_group)
+        if spine_data is None:
+            auto_btn.setEnabled(False)
+        assign_row.addWidget(auto_btn)
         assign_row.addStretch()
         layout.addLayout(assign_row)
 
@@ -561,6 +650,21 @@ class PreSplitDialog(QDialog):
     def _each_own_group(self):
         for i in range(self._tree.topLevelItemCount()):
             self._tree.topLevelItem(i).setText(1, str(i + 1))
+
+    def _auto_group(self):
+        """Group animations by visible slot fingerprint."""
+        if self._spine_data is None:
+            return
+        groups = auto_group_animations(self._spine_data)
+        # Build reverse map: anim_name -> group_label
+        anim_to_group = {}
+        for group_label, anims in groups.items():
+            for anim in anims:
+                anim_to_group[anim] = group_label
+        for i in range(self._tree.topLevelItemCount()):
+            item = self._tree.topLevelItem(i)
+            anim_name = item.text(0)
+            item.setText(1, anim_to_group.get(anim_name, ""))
 
     def get_groups(self) -> dict[str, list[str]]:
         """Return {group_name: [animation_names]} for assigned animations."""
@@ -932,7 +1036,7 @@ class DrawOrderOptimizerTab:
             return
 
         # Open pre-split dialog
-        dialog = PreSplitDialog(anim_names)
+        dialog = PreSplitDialog(anim_names, spine_data=spine_data)
         if dialog.exec() != QDialog.Accepted:
             return
 

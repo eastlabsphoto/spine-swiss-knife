@@ -559,16 +559,27 @@ def _render_all_animations(spine_data, textures, slot_order,
 def _compare_with_original(spine_data, textures, original_images,
                             candidate_slots, anim_names, fps, bbox,
                             tolerance, threshold=0.02, on_log=None,
-                            early_exit=True, debug_dir=None):
+                            early_exit=True, debug_dir=None,
+                            moved_slots=None, slot_visibility=None):
     """Render candidate and compare against cached original images.
 
     When *debug_dir* is set, saves frame pairs (original + candidate)
     for frames that differ, so the user can inspect visually.
 
+    When *moved_slots* (set of slot names) and *slot_visibility* (dict
+    mapping anim name -> frozenset of visible slot names) are both
+    provided, animations where none of the moved slots are visible are
+    skipped — they cannot be affected by the reorder.
+
     Returns ``(all_match, list_of_diff_anim_names)``.
     """
     diffs = []
     for anim_name in anim_names:
+        # Skip animations unaffected by this move
+        if moved_slots and slot_visibility:
+            visible = slot_visibility.get(anim_name, frozenset())
+            if not moved_slots & visible:
+                continue
         QApplication.processEvents()
         imgs_orig = original_images.get(anim_name, [])
         imgs_cand = render_animation_sequence(
