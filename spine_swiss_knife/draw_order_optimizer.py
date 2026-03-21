@@ -346,13 +346,19 @@ def _bisect_zone(
 
 def optimize_draw_order(spine_data, fps=60, tolerance=5,
                          threshold=0.02, textures=None, on_log=None,
-                         debug_dir=None, baseline_data=None):
+                         debug_dir=None, baseline_data=None,
+                         anim_filter=None):
     """Zone-based draw-order optimisation with QPainter verification.
 
     1. Render original once (cached).
     2. Compute optimal slot order (zone-aware stable partition).
     3. Render optimized, compare with original.
     4. If mismatch, bisect on moved slots to find safe subset.
+
+    When *anim_filter* is a set of animation names, only those animations
+    (plus setup pose) are rendered and compared.  This allows per-group
+    optimisation where fewer animation constraints give the optimizer
+    more freedom to reorder slots.
 
     Returns dict with: success, modified_data, original_groups,
     optimized_groups, moved_slots, unmovable_slots, message
@@ -398,7 +404,10 @@ def optimize_draw_order(spine_data, fps=60, tolerance=5,
     log(f"Render canvas: {bw}\u00d7{bh}px")
 
     animations = spine_data.get("animations", {})
-    anim_names = [None] + list(animations.keys())
+    if anim_filter is not None:
+        anim_names = [None] + [n for n in animations if n in anim_filter]
+    else:
+        anim_names = [None] + list(animations.keys())
 
     # -- Step 1: Render original ONCE (in-memory only) --
     log("Rendering original...")
@@ -483,6 +492,88 @@ def optimize_draw_order(spine_data, fps=60, tolerance=5,
 
 
 # ---------------------------------------------------------------------------
+# Pre-split dialog
+# ---------------------------------------------------------------------------
+
+class PreSplitDialog(QDialog):
+    """Assign animations to groups for per-group draw-order optimisation."""
+
+    def __init__(self, animation_names: list[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(tr("draw_order.presplit.title"))
+        self.resize(600, 500)
+
+        layout = QVBoxLayout(self)
+
+        info = QLabel(tr("draw_order.presplit.info"))
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        # Animation tree
+        self._tree = QTreeWidget()
+        self._tree.setHeaderLabels([
+            tr("draw_order.presplit.tree.animation"),
+            tr("draw_order.presplit.tree.group"),
+        ])
+        self._tree.setSelectionMode(QTreeWidget.ExtendedSelection)
+        self._tree.header().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self._tree, 1)
+
+        for name in animation_names:
+            QTreeWidgetItem(self._tree, [name, ""])
+
+        # Group assignment row
+        assign_row = QHBoxLayout()
+        assign_row.addWidget(QLabel(tr("draw_order.presplit.group_label")))
+        self._group_edit = QLineEdit()
+        self._group_edit.setMaximumWidth(120)
+        assign_row.addWidget(self._group_edit)
+        assign_btn = QPushButton(tr("draw_order.presplit.assign_btn"))
+        assign_btn.clicked.connect(self._assign_group)
+        assign_row.addWidget(assign_btn)
+        clear_btn = QPushButton(tr("draw_order.presplit.clear_btn"))
+        clear_btn.clicked.connect(self._clear_selected)
+        assign_row.addWidget(clear_btn)
+        each_btn = QPushButton(tr("draw_order.presplit.each_own_btn"))
+        each_btn.clicked.connect(self._each_own_group)
+        assign_row.addWidget(each_btn)
+        assign_row.addStretch()
+        layout.addLayout(assign_row)
+
+        # OK / Cancel
+        from PySide6.QtWidgets import QDialogButtonBox
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _assign_group(self):
+        group = self._group_edit.text().strip()
+        if not group:
+            return
+        for item in self._tree.selectedItems():
+            item.setText(1, group)
+
+    def _clear_selected(self):
+        for item in self._tree.selectedItems():
+            item.setText(1, "")
+
+    def _each_own_group(self):
+        for i in range(self._tree.topLevelItemCount()):
+            self._tree.topLevelItem(i).setText(1, str(i + 1))
+
+    def get_groups(self) -> dict[str, list[str]]:
+        """Return {group_name: [animation_names]} for assigned animations."""
+        groups: dict[str, list[str]] = {}
+        for i in range(self._tree.topLevelItemCount()):
+            item = self._tree.topLevelItem(i)
+            group = item.text(1).strip()
+            if group:
+                groups.setdefault(group, []).append(item.text(0))
+        return groups
+
+
+# ---------------------------------------------------------------------------
 # UI Tab
 # ---------------------------------------------------------------------------
 
@@ -527,6 +618,11 @@ class DrawOrderOptimizerTab:
         self._optimize_btn.clicked.connect(self._optimize)
         btn_row.addWidget(self._optimize_btn)
 
+        self._presplit_btn = QPushButton(tr("draw_order.presplit_btn"))
+        self._presplit_btn.setEnabled(False)
+        self._presplit_btn.setCursor(Qt.PointingHandCursor)
+        self._presplit_btn.clicked.connect(self._presplit_optimize)
+        btn_row.addWidget(self._presplit_btn)
 
         btn_row.addWidget(QLabel(tr("draw_order.tolerance_label")))
         self._tolerance_spin = QSpinBox()
@@ -578,6 +674,7 @@ class DrawOrderOptimizerTab:
         self._info.setText(tr("draw_order.info"))
         self._stats.setText(tr("draw_order.default_stats"))
         self._optimize_btn.setText(tr("draw_order.optimize_btn"))
+        self._presplit_btn.setText(tr("draw_order.presplit_btn"))
         self._tree.setHeaderLabels([
             tr("draw_order.tree.index"),
             tr("draw_order.tree.slot"),
@@ -634,7 +731,9 @@ class DrawOrderOptimizerTab:
         if has_do:
             self._log_line(tr("draw_order.warn_timelines"), "#e8a838")
 
-        self._optimize_btn.setEnabled(analysis["can_optimize"])
+        can = analysis["can_optimize"]
+        self._optimize_btn.setEnabled(can)
+        self._presplit_btn.setEnabled(can)
 
     def _optimize(self):
         json_path = self._get_config("json")
@@ -808,3 +907,201 @@ class DrawOrderOptimizerTab:
             )
 
         self._optimize_btn.setEnabled(True)
+
+    def _presplit_optimize(self):
+        """Run draw-order optimisation per animation group (pre-split mode).
+
+        Opens a dialog where the user assigns animations to groups.
+        Each group is optimised independently (fewer constraints = more
+        freedom), then the results are chained into a single slot order.
+        """
+        json_path = self._get_config("json")
+        if not json_path or not os.path.isfile(json_path):
+            QMessageBox.critical(None, tr("err.title"), tr("err.no_json"))
+            return
+
+        try:
+            spine_data = load_spine_json(json_path)
+        except Exception as e:
+            QMessageBox.critical(None, tr("err.title"),
+                                 tr("err.parse_json", error=e))
+            return
+
+        anim_names = list(spine_data.get("animations", {}).keys())
+        if not anim_names:
+            return
+
+        # Open pre-split dialog
+        dialog = PreSplitDialog(anim_names)
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        groups = dialog.get_groups()
+        if not groups:
+            QMessageBox.warning(None, tr("err.title"),
+                                tr("draw_order.presplit.no_groups"))
+            return
+
+        # Confirm
+        summary = "\n".join(
+            f"  {name}: {len(anims)} animation(s)"
+            for name, anims in groups.items()
+        )
+        if QMessageBox.question(
+            None, tr("confirm.title"),
+            tr("draw_order.presplit.confirm",
+               count=len(groups), summary=summary),
+        ) != QMessageBox.Yes:
+            return
+
+        self._log.clear()
+        fps = 60
+        tolerance = self._tolerance_spin.value()
+        threshold = threshold_percent_to_ratio(self._threshold_spin.value())
+
+        # Load textures
+        atlas_path = self._get_config("atlas")
+        textures = None
+        if atlas_path and os.path.isfile(atlas_path):
+            try:
+                textures = load_atlas_textures(atlas_path)
+                self._log_line(f"Loaded {len(textures)} textures.", "#6ec072")
+            except Exception:
+                pass
+        if not textures:
+            self._log_line("No atlas — optimising without visual check.",
+                           "#e8a838")
+
+        # Resolve baseline for backup
+        backup_exists = os.path.isfile(json_path + ".backup")
+        baseline_path, backup_path, create_backup = resolve_baseline_paths(
+            json_path, backup_exists=backup_exists)
+
+        # Debug dir
+        debug_dir = None
+        if self._debug_cb.isChecked():
+            project_dir = os.path.dirname(json_path)
+            debug_dir = os.path.join(project_dir,
+                                     "_ssk_draw_order_debug")
+            if Path(debug_dir).exists():
+                import shutil
+                shutil.rmtree(debug_dir)
+
+        self._optimize_btn.setEnabled(False)
+        self._presplit_btn.setEnabled(False)
+        QApplication.processEvents()
+
+        initial_groups_count = count_blend_groups(
+            spine_data.get("slots", []))
+        current_data = spine_data
+
+        try:
+            for group_name, group_anims in groups.items():
+                self._log_line(
+                    tr("draw_order.presplit.log.group",
+                       name=group_name, count=len(group_anims)),
+                    "#89b4fa")
+
+                result = optimize_draw_order(
+                    current_data,
+                    fps=fps,
+                    tolerance=tolerance,
+                    threshold=threshold,
+                    textures=textures,
+                    baseline_data=current_data,
+                    anim_filter=set(group_anims),
+                    debug_dir=debug_dir,
+                    on_log=lambda msg: (
+                        self._log_line(msg, "#6ec072"),
+                        QApplication.processEvents(),
+                    ),
+                )
+
+                if result["success"] and "modified_data" in result:
+                    prev = result["original_groups"]
+                    after = result["optimized_groups"]
+                    current_data = result["modified_data"]
+                    self._log_line(
+                        f"  Group '{group_name}': "
+                        f"{prev} \u2192 {after} groups",
+                        "#a6e3a1")
+                else:
+                    self._log_line(
+                        f"  Group '{group_name}': "
+                        f"{result.get('message', 'no improvement')}",
+                        "#e8a838")
+        except Exception as e:
+            self._log_line(f"Error: {e}", "#ff6666")
+            import traceback
+            self._log_line(traceback.format_exc(), "#ff6666")
+            self._optimize_btn.setEnabled(True)
+            self._presplit_btn.setEnabled(True)
+            return
+
+        final_groups_count = count_blend_groups(
+            current_data.get("slots", []))
+
+        self._log_line(
+            tr("draw_order.presplit.log.final",
+               initial=initial_groups_count,
+               final=final_groups_count),
+            "#a6e3a1")
+
+        if final_groups_count < initial_groups_count:
+            # Show comparison dialog
+            if textures:
+                comp = CompareDialog(spine_data, current_data, textures)
+                accepted = comp.exec() == QDialog.Accepted
+            else:
+                accepted = QMessageBox.question(
+                    None, "Apply Optimization?",
+                    f"Reduced {initial_groups_count} \u2192 "
+                    f"{final_groups_count} groups.\n\n"
+                    "Apply the optimized draw order?",
+                ) == QMessageBox.Yes
+
+            if accepted:
+                import shutil
+                try:
+                    if create_backup:
+                        shutil.copy2(json_path, backup_path)
+                    save_spine_json(json_path, current_data)
+                except Exception as e:
+                    QMessageBox.critical(None, tr("err.title"),
+                                         tr("err.save_json", error=e))
+                    self._optimize_btn.setEnabled(True)
+                    self._presplit_btn.setEnabled(True)
+                    return
+
+                moved = _moved_names(
+                    spine_data.get("slots", []),
+                    current_data.get("slots", []))
+                self._log_line(
+                    tr("draw_order.done",
+                       orig=initial_groups_count,
+                       final=final_groups_count,
+                       moved=len(moved),
+                       skipped=0,
+                       backup=backup_path),
+                    "#6ec072")
+
+                QMessageBox.information(
+                    None, tr("done.title"),
+                    tr("draw_order.done",
+                       orig=initial_groups_count,
+                       final=final_groups_count,
+                       moved=len(moved),
+                       skipped=0,
+                       backup=backup_path))
+
+                if self._on_modified:
+                    self._on_modified()
+                else:
+                    self._analyze()
+            else:
+                self._log_line("Discarded optimization.", "#e8a838")
+        else:
+            self._log_line("No improvement achieved.", "#e8a838")
+
+        self._optimize_btn.setEnabled(True)
+        self._presplit_btn.setEnabled(True)

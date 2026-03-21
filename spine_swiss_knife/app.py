@@ -23,6 +23,8 @@ from .i18n import tr, language_changed
 from .settings import settings
 from .spine_cli import export_spine_project, import_to_spine_project
 from .spine_downgrader import SpineDowngraderTab, convert_to_destination
+from .image_flattener import ImageFlattenerTab
+from .merge_skeletons import MergeSkeletonsTab
 from .welcome_page import WelcomePage
 from .project_analyzer import ProjectAnalyzerTab
 from .optimizer import OptimizerTab
@@ -57,6 +59,8 @@ _SIDEBAR_KEYS = [
     ("app.sidebar.converter", "app.tip.converter"),
     ("app.sidebar.unpacker", "app.tip.unpacker"),
     ("app.sidebar.static_export", "app.tip.static_export"),
+    ("app.sidebar.flattener", "app.tip.flattener"),
+    ("app.sidebar.merge", "app.tip.merge"),
     ("app.sidebar.viewer", "app.tip.viewer"),
 ]
 
@@ -175,9 +179,28 @@ class SpineSwissKnifeApp(QMainWindow):
         self._json_edit = QLineEdit()
         self._json_edit.setPlaceholderText(tr("app.json_placeholder"))
         config_grid.addWidget(self._json_edit, 1, 1)
+
+        # JSON buttons container (Browse + JSON-mode-only buttons)
+        self._json_btn_container = QWidget()
+        self._json_btn_container.setStyleSheet("background: transparent;")
+        json_btn_layout = QHBoxLayout(self._json_btn_container)
+        json_btn_layout.setContentsMargins(0, 0, 0, 0)
+        json_btn_layout.setSpacing(4)
         self._btn_json = QPushButton(tr("app.browse"))
         self._btn_json.clicked.connect(self._browse_json)
-        config_grid.addWidget(self._btn_json, 1, 2)
+        json_btn_layout.addWidget(self._btn_json)
+        self._btn_export_atlas = QPushButton(tr("json_mode.export_atlas_btn"))
+        self._btn_export_atlas.setCursor(Qt.PointingHandCursor)
+        self._btn_export_atlas.clicked.connect(self._export_atlas_from_json)
+        self._btn_export_atlas.hide()
+        json_btn_layout.addWidget(self._btn_export_atlas)
+        self._btn_save_spine = QPushButton(tr("json_mode.save_spine_btn"))
+        self._btn_save_spine.setProperty("role", "primary")
+        self._btn_save_spine.setCursor(Qt.PointingHandCursor)
+        self._btn_save_spine.clicked.connect(self._save_json_as_spine)
+        self._btn_save_spine.hide()
+        json_btn_layout.addWidget(self._btn_save_spine)
+        config_grid.addWidget(self._json_btn_container, 1, 2)
 
         # Row 2: Atlas
         self._atlas_label = QLabel(tr("app.atlas_label"))
@@ -249,6 +272,8 @@ class SpineSwissKnifeApp(QMainWindow):
             SpineDowngraderTab(self._tabs, self._get_config),
             TextureUnpackerTab(self._tabs, self._get_config),
             StaticExporterTab(self._tabs, self._get_config),
+            ImageFlattenerTab(self._tabs, self._get_config, on_modified=notify),
+            MergeSkeletonsTab(self._tabs, self._get_config),
             SpineViewerTab(self._tabs, self._get_config),
         ]
 
@@ -268,6 +293,8 @@ class SpineSwissKnifeApp(QMainWindow):
         self._spine_project_label.hide()
         self._spine_project_edit.hide()
         self._spine_btn_container.hide()
+        self._btn_export_atlas.hide()
+        self._btn_save_spine.hide()
 
     def _make_cli_progress(self) -> QProgressDialog:
         """Create a modal progress dialog for Spine CLI operations."""
@@ -339,10 +366,12 @@ class SpineSwissKnifeApp(QMainWindow):
             img_dir = Path(spine_path).parent / "images"
             self._images_edit.setText(str(img_dir) if img_dir.is_dir() else "")
 
-        # Show .spine row, make fields read-only
+        # Show .spine row, make fields read-only; hide JSON-mode buttons
         self._spine_project_label.show()
         self._spine_project_edit.show()
         self._spine_btn_container.show()
+        self._btn_export_atlas.hide()
+        self._btn_save_spine.hide()
         self._json_edit.setReadOnly(True)
         self._atlas_edit.setReadOnly(True)
         self._images_edit.setReadOnly(True)
@@ -372,6 +401,10 @@ class SpineSwissKnifeApp(QMainWindow):
         self._btn_json.setEnabled(True)
         self._btn_atlas.setEnabled(True)
         self._btn_images.setEnabled(True)
+
+        # Show JSON-mode-only buttons
+        self._btn_export_atlas.show()
+        self._btn_save_spine.show()
 
         # Clear paths
         self._json_edit.clear()
@@ -499,6 +532,152 @@ class SpineSwissKnifeApp(QMainWindow):
             QMessageBox.warning(self, tr("err.title"),
                                 tr("spine_mode.import_failed", error=error))
 
+    # ── JSON mode operations ──
+
+    def _export_atlas_from_json(self):
+        """Export atlas (pack texture) from the current JSON via Spine CLI.
+
+        Imports the JSON into a temporary .spine file, then exports with
+        atlas packing.  Atlas files are placed next to the JSON.
+        """
+        json_path = self._json_edit.text().strip()
+        if not json_path or not Path(json_path).is_file():
+            QMessageBox.warning(self, tr("err.title"), tr("err.no_json"))
+            return
+
+        exe = settings.spine_executable()
+        if not exe:
+            QMessageBox.warning(self, tr("err.title"), tr("welcome.spine_not_set"))
+            return
+
+        # Read version from JSON
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            version = data.get("skeleton", {}).get("spine", "")
+        except Exception as e:
+            QMessageBox.warning(self, tr("err.title"), str(e))
+            return
+
+        json_dir = Path(json_path).parent
+        stem = Path(json_path).stem
+        temp_spine = str(json_dir / f"_ssk_temp_{stem}.spine")
+        export_dir = str(json_dir / f"_ssk_atlas_export_{stem}")
+
+        progress = self._make_cli_progress()
+
+        # Step 1: Import JSON to temp .spine
+        result = import_to_spine_project(
+            exe, json_path, temp_spine,
+            on_output=self._cli_output_updater(progress),
+            target_version=version or None,
+        )
+        if not result.success:
+            progress.close()
+            try:
+                Path(temp_spine).unlink(missing_ok=True)
+            except OSError:
+                pass
+            error = result.stderr or result.stdout or "Unknown error"
+            QMessageBox.warning(self, tr("err.title"),
+                                tr("json_mode.atlas_export_failed", error=error))
+            return
+
+        # Step 2: Export with atlas pack from temp .spine
+        result = export_spine_project(
+            exe, temp_spine, export_dir,
+            on_output=self._cli_output_updater(progress),
+            pack=True,
+        )
+        progress.close()
+
+        # Clean up temp .spine
+        try:
+            Path(temp_spine).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        if not result.success:
+            shutil.rmtree(export_dir, ignore_errors=True)
+            error = result.stderr or result.stdout or "Unknown error"
+            QMessageBox.warning(self, tr("err.title"),
+                                tr("json_mode.atlas_export_failed", error=error))
+            return
+
+        # Move atlas files to JSON directory
+        export_path = Path(export_dir)
+        atlas_dst = ""
+        moved_files = []
+        for f in export_path.iterdir():
+            if f.name.endswith(".atlas") or f.name.endswith(".atlas.txt"):
+                dst = json_dir / f.name
+                shutil.move(str(f), str(dst))
+                atlas_dst = str(dst)
+                moved_files.append(dst.name)
+            elif f.suffix == ".png":
+                dst = json_dir / f.name
+                shutil.move(str(f), str(dst))
+                moved_files.append(dst.name)
+
+        # Clean up export dir
+        shutil.rmtree(export_dir, ignore_errors=True)
+
+        if atlas_dst:
+            self._atlas_edit.setText(atlas_dst)
+            QMessageBox.information(
+                self, tr("done.title"),
+                tr("json_mode.atlas_done",
+                   files=", ".join(moved_files)))
+        else:
+            QMessageBox.warning(self, tr("err.title"),
+                                tr("json_mode.no_atlas_produced"))
+
+    def _save_json_as_spine(self):
+        """Save current JSON as a .spine project file via Spine CLI."""
+        json_path = self._json_edit.text().strip()
+        if not json_path or not Path(json_path).is_file():
+            QMessageBox.warning(self, tr("err.title"), tr("err.no_json"))
+            return
+
+        exe = settings.spine_executable()
+        if not exe:
+            QMessageBox.warning(self, tr("err.title"), tr("welcome.spine_not_set"))
+            return
+
+        # Read version from JSON
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            version = data.get("skeleton", {}).get("spine", "")
+        except Exception:
+            version = ""
+
+        # Let user choose save location
+        suggested = str(Path(json_path).with_suffix(".spine"))
+        spine_path, _ = QFileDialog.getSaveFileName(
+            self, tr("json_mode.save_spine_title"), suggested,
+            tr("welcome.filter.spine_project"),
+        )
+        if not spine_path:
+            return
+
+        progress = self._make_cli_progress()
+        result = import_to_spine_project(
+            exe, json_path, spine_path,
+            on_output=self._cli_output_updater(progress),
+            target_version=version or None,
+        )
+        progress.close()
+
+        if result.success:
+            QMessageBox.information(
+                self, tr("done.title"),
+                tr("json_mode.save_spine_done", path=spine_path))
+        else:
+            error = result.stderr or result.stdout or "Unknown error"
+            QMessageBox.warning(self, tr("err.title"),
+                                tr("json_mode.save_spine_failed", error=error))
+
     def _reexport_spine_project(self):
         """Re-export from .spine, overwriting current JSON and atlas."""
         if not self._spine_project_path:
@@ -548,6 +727,8 @@ class SpineSwissKnifeApp(QMainWindow):
         self._images_label.setText(tr("app.images_label"))
         self._images_edit.setPlaceholderText(tr("app.images_placeholder"))
         self._btn_json.setText(tr("app.browse"))
+        self._btn_export_atlas.setText(tr("json_mode.export_atlas_btn"))
+        self._btn_save_spine.setText(tr("json_mode.save_spine_btn"))
         self._btn_atlas.setText(tr("app.browse"))
         self._btn_images.setText(tr("app.browse"))
         for idx, (name_key, tip_key) in enumerate(_SIDEBAR_KEYS):
@@ -662,10 +843,10 @@ class SpineSwissKnifeApp(QMainWindow):
             tabs[13]._load()
         except Exception:
             pass
-        # Viewer — needs atlas
+        # Viewer — needs atlas (last tab)
         if has_atlas:
             try:
-                tabs[14]._load()
+                tabs[16]._load()
             except Exception:
                 pass
 
