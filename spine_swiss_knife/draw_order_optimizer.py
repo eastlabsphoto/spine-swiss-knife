@@ -7,7 +7,7 @@ from pathlib import Path
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QSpinBox,
-    QDoubleSpinBox, QCheckBox,
+    QDoubleSpinBox, QCheckBox, QLineEdit, QDialogButtonBox,
     QTabWidget, QTreeWidget, QTreeWidgetItem, QHeaderView, QMessageBox,
     QTextEdit, QApplication, QDialog,
 )
@@ -630,7 +630,6 @@ class PreSplitDialog(QDialog):
         layout.addLayout(assign_row)
 
         # OK / Cancel
-        from PySide6.QtWidgets import QDialogButtonBox
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
