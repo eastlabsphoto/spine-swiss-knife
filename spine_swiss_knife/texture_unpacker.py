@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QLineEdit,
     QTabWidget, QTextEdit, QMessageBox, QFileDialog, QScrollArea, QSplitter,
 )
-from PySide6.QtGui import QTextCharFormat, QColor, QFont, QPixmap
+from PySide6.QtGui import QTextCharFormat, QTextCursor, QColor, QFont, QPixmap
 from PySide6.QtCore import Qt
 
 from .i18n import tr, language_changed
@@ -157,21 +157,32 @@ def extract_spine_frames(atlas_path: str, output_dir: str) -> int:
     return count
 
 
-def extract_json_frames(data: dict, output_dir: str, json_path: str) -> int:
+def extract_json_frames(data: dict, output_dir: str, json_path: str):
     count = 0
+    warnings = []
     if "textures" in data:
         for texture in data["textures"]:
             image_path = os.path.join(os.path.dirname(json_path), texture["image"])
-            atlas_image = Image.open(image_path)
+            atlas_image = Image.open(image_path).convert("RGBA")
+            aw, ah = atlas_image.size
             for frame in texture["frames"]:
                 fd = frame["frame"]
                 ss = frame["sourceSize"]
                 sss = frame["spriteSourceSize"]
-                frame_img = atlas_image.crop(
-                    (fd["x"], fd["y"], fd["x"] + fd["w"], fd["y"] + fd["h"])
-                )
+                x0, y0 = fd["x"], fd["y"]
+                x1, y1 = x0 + fd["w"], y0 + fd["h"]
+                x0c = min(max(x0, 0), aw)
+                y0c = min(max(y0, 0), ah)
+                x1c = min(max(x1, 0), aw)
+                y1c = min(max(y1, 0), ah)
+                if x1c <= x0c or y1c <= y0c:
+                    warnings.append(f"Skipped '{frame['filename']}': region outside image bounds.")
+                    continue
+                frame_img = atlas_image.crop((x0c, y0c, x1c, y1c))
                 restored = Image.new("RGBA", (ss["w"], ss["h"]), (0, 0, 0, 0))
-                restored.paste(frame_img, (sss["x"], sss["y"]))
+                paste_x = sss["x"] + (x0c - x0)
+                paste_y = sss["y"] + (y0c - y0)
+                restored.paste(frame_img, (paste_x, paste_y))
                 base = os.path.splitext(frame["filename"])[0]
                 out_path = os.path.join(output_dir, f"{base}.png")
                 os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -186,21 +197,58 @@ def extract_json_frames(data: dict, output_dir: str, json_path: str) -> int:
         except FileNotFoundError:
             image_path = os.path.join(json_dir, os.path.basename(meta["image"]))
             atlas_image = Image.open(image_path)
-        for filename, frame in data["frames"].items():
-            fd = frame["frame"]
-            ss = frame["sourceSize"]
-            sss = frame["spriteSourceSize"]
-            frame_img = atlas_image.crop(
-                (fd["x"], fd["y"], fd["x"] + fd["w"], fd["y"] + fd["h"])
+        atlas_image = atlas_image.convert("RGBA")
+        aw, ah = atlas_image.size
+        meta_size = meta.get("size", {})
+        mw, mh = meta_size.get("w", aw), meta_size.get("h", ah)
+        size_match = (aw, ah) == (mw, mh)
+
+        if not size_match:
+            # Derive grid layout from JSON frame coordinates, then
+            # re-map to actual image dimensions.
+            xs = sorted({f["frame"]["x"] for f in data["frames"].values()})
+            ys = sorted({f["frame"]["y"] for f in data["frames"].values()})
+            cols = len(xs)
+            rows = len(ys)
+            cell_w = aw / cols
+            cell_h = ah / rows
+            x_to_col = {x: i for i, x in enumerate(xs)}
+            y_to_row = {y: i for i, y in enumerate(ys)}
+            warnings.append(
+                f"Atlas size mismatch ({aw}x{ah} vs JSON {mw}x{mh}). "
+                f"Using grid extraction: {rows} rows x {cols} cols, "
+                f"cell ~{cell_w:.0f}x{cell_h:.0f}px."
             )
-            restored = Image.new("RGBA", (ss["w"], ss["h"]), (0, 0, 0, 0))
-            restored.paste(frame_img, (sss["x"], sss["y"]))
-            base = os.path.splitext(filename)[0]
-            out_path = os.path.join(output_dir, f"{base}.png")
-            os.makedirs(os.path.dirname(out_path), exist_ok=True)
-            restored.save(out_path)
-            count += 1
-    return count
+            for filename, frame in data["frames"].items():
+                fd = frame["frame"]
+                col = x_to_col[fd["x"]]
+                row = y_to_row[fd["y"]]
+                x0 = round(col * cell_w)
+                y0 = round(row * cell_h)
+                x1 = round((col + 1) * cell_w)
+                y1 = round((row + 1) * cell_h)
+                frame_img = atlas_image.crop((x0, y0, x1, y1))
+                base = os.path.splitext(filename)[0]
+                out_path = os.path.join(output_dir, f"{base}.png")
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                frame_img.save(out_path)
+                count += 1
+        else:
+            for filename, frame in data["frames"].items():
+                fd = frame["frame"]
+                ss = frame["sourceSize"]
+                sss = frame["spriteSourceSize"]
+                frame_img = atlas_image.crop(
+                    (fd["x"], fd["y"], fd["x"] + fd["w"], fd["y"] + fd["h"])
+                )
+                restored = Image.new("RGBA", (ss["w"], ss["h"]), (0, 0, 0, 0))
+                restored.paste(frame_img, (sss["x"], sss["y"]))
+                base = os.path.splitext(filename)[0]
+                out_path = os.path.join(output_dir, f"{base}.png")
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                restored.save(out_path)
+                count += 1
+    return count, warnings
 
 
 # ==========================================================================
@@ -304,9 +352,9 @@ class TextureUnpackerTab:
         fmt = QTextCharFormat()
         fmt.setForeground(QColor(color))
         if bold:
-            fmt.setFontWeight(QFont.Bold)
+            fmt.setFontWeight(QFont.Weight.Bold)
         cursor = self._log.textCursor()
-        cursor.movePosition(cursor.End)
+        cursor.movePosition(QTextCursor.MoveOperation.End)
         cursor.insertText(text + "\n", fmt)
         self._log.setTextCursor(cursor)
         self._log.ensureCursorVisible()
@@ -381,7 +429,9 @@ class TextureUnpackerTab:
                 else:
                     self._append(tr("unpacker.log.unknown_json"), "#f38ba8", bold=True)
                     return
-                count = extract_json_frames(data, output_dir, file_path)
+                count, warnings = extract_json_frames(data, output_dir, file_path)
+                for w in warnings:
+                    self._append(f"⚠ {w}", "#fab387")
             else:
                 self._append(tr("unpacker.log.unsupported_ext", ext=ext), "#f38ba8", bold=True)
                 return

@@ -632,6 +632,12 @@ def import_to_spine_project(
                     version = _json.load(f).get("skeleton", {}).get("spine", "")
             except Exception:
                 pass
+    # Strip any downgrade-history chain (e.g. "3.7-from-3.8-from-4.2.43").
+    # The Spine CLI ``-u`` flag expects a plain version like "3.7.94"; the
+    # "-from-" suffix is a Spine convention recorded by the downgrader and
+    # is rejected by Spine.exe (exit code 1).
+    if version:
+        version = str(version).split("-from-")[0]
     if version:
         cmd += ["-u", version]
     cmd += ["-i", json_path, "-o", spine_file, "-r"]

@@ -32,7 +32,9 @@ class _I18n(QObject):
         self._load(lang)
         self.language_changed.emit()
 
-    def tr(self, key: str, **kwargs) -> str:
+    def tr(self, key: str, /, **kwargs) -> str:
+        # `key` is positional-only so a format placeholder named {key} (passed as
+        # tr("some.key", key=...)) lands in **kwargs instead of colliding with this param.
         text = self._strings.get(key, key)
         if kwargs:
             try:
