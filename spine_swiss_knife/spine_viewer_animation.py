@@ -10,7 +10,10 @@ import os
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap, QPainter, QTransform, QPolygonF, QPainterPath
 
-from .spine_json import normalize_skins, attachment_image_key, clip_end_marker_after_slot
+from .spine_json import (
+    normalize_skins, attachment_image_key, clip_end_marker_after_slot,
+    mesh_is_weighted, resolve_weighted_vertices,
+)
 from .texture_unpacker import parse_spine_atlas
 
 
@@ -797,6 +800,11 @@ def build_draw_list(
     draw_list = []
     pending_clip_ends: set[str] = set()
 
+    # Bone transforms indexed by global bone index, for weighted attachments.
+    bone_tx_list = [
+        world_transforms.get(b.get("name")) for b in spine_data.get("bones", [])
+    ]
+
     for slot in slots:
         slot_name = slot["name"]
         bone_name = slot["bone"]
@@ -869,12 +877,18 @@ def build_draw_list(
                                   "slot_name": slot_name})
                 pending_clip_ends.discard(slot_name)
             setup_verts = att_data.get("vertices", [])
-            deform_key = (slot_name, att_name)
-            if deform_states and deform_key in deform_states:
-                deltas = deform_states[deform_key]
-                final_verts = [sv + dv for sv, dv in zip(setup_verts, deltas)]
+            weighted = mesh_is_weighted(
+                setup_verts, att_data.get("vertexCount", 0))
+            if weighted:
+                # Weighted clip: decode to world space (deform not applied).
+                final_verts = resolve_weighted_vertices(setup_verts, bone_tx_list)
             else:
-                final_verts = list(setup_verts)
+                deform_key = (slot_name, att_name)
+                if deform_states and deform_key in deform_states:
+                    deltas = deform_states[deform_key]
+                    final_verts = [sv + dv for sv, dv in zip(setup_verts, deltas)]
+                else:
+                    final_verts = list(setup_verts)
             clip_end_slot = att_data.get("end", "")
             if clip_end_slot:
                 pending_clip_ends.add(clip_end_slot)
@@ -883,18 +897,27 @@ def build_draw_list(
                 "bone": bone_name,
                 "slot_name": slot_name,
                 "vertices": final_verts,
+                "world_space": weighted,
                 "clip_end": clip_end_slot,
             })
             continue
 
         if att_type == "mesh":
             setup_verts = att_data.get("vertices", [])
-            deform_key = (slot_name, att_name)
-            if deform_states and deform_key in deform_states:
-                deltas = deform_states[deform_key]
-                final_verts = [sv + dv for sv, dv in zip(setup_verts, deltas)]
+            uvs = att_data.get("uvs", [])
+            weighted = mesh_is_weighted(setup_verts, len(uvs) // 2)
+            if weighted:
+                # Weighted (bone-rigged) mesh: decode to world space. The
+                # vertices array is not a flat list of (x, y) pairs, so fine
+                # deform deltas are not applied here.
+                final_verts = resolve_weighted_vertices(setup_verts, bone_tx_list)
             else:
-                final_verts = list(setup_verts)
+                deform_key = (slot_name, att_name)
+                if deform_states and deform_key in deform_states:
+                    deltas = deform_states[deform_key]
+                    final_verts = [sv + dv for sv, dv in zip(setup_verts, deltas)]
+                else:
+                    final_verts = list(setup_verts)
 
             image_key = attachment_image_key(att_name, att_data)
             pixmap = textures.get(image_key)
@@ -906,7 +929,8 @@ def build_draw_list(
                 "bone": bone_name,
                 "slot_name": slot_name,
                 "vertices": final_verts,
-                "uvs": att_data.get("uvs", []),
+                "world_space": weighted,
+                "uvs": uvs,
                 "triangles": att_data.get("triangles", []),
                 "pixmap": pixmap,
                 "color": color,

@@ -86,6 +86,64 @@ def attachment_image_key(att_name: str, att_data: dict) -> str:
     return att_data.get("path", att_name)
 
 
+def mesh_is_weighted(vertices: list, vertex_count: int) -> bool:
+    """Return True when a VertexAttachment uses Spine's weighted vertex format.
+
+    A non-weighted mesh stores a flat list of (x, y) pairs, so its vertices
+    array has exactly ``vertex_count * 2`` values. Weighted (bone-rigged)
+    attachments store, per vertex, ``boneCount`` followed by
+    ``(boneIndex, x, y, weight)`` for each influencing bone, so the array is a
+    different (and usually longer, sometimes odd) length.
+
+    *vertex_count* is ``len(uvs) // 2`` for meshes or the ``vertexCount`` field
+    for clipping / path / bounding-box attachments.
+    """
+    return vertex_count > 0 and len(vertices) != vertex_count * 2
+
+
+def resolve_weighted_vertices(vertices: list, bone_transforms: list) -> list[float]:
+    """Decode weighted-mesh *vertices* into a flat list of world-space pairs.
+
+    Weighted format, per vertex::
+
+        boneCount, (boneIndex, x, y, weight) * boneCount
+
+    where (x, y) are coordinates in each bone's local space. The world position
+    is the weighted sum of each bone's current world transform applied to its
+    local coordinate.
+
+    *bone_transforms* is indexed by global bone index; each element exposes the
+    attributes ``a, b, c, d, worldX, worldY`` (a ``BoneTransform``) or is
+    ``None`` when the bone is missing. Returns ``[wx0, wy0, wx1, wy1, ...]``.
+    """
+    out: list[float] = []
+    i = 0
+    n = len(vertices)
+    n_bones = len(bone_transforms)
+    while i < n:
+        bone_count = int(vertices[i])
+        i += 1
+        wx = 0.0
+        wy = 0.0
+        for _ in range(bone_count):
+            if i + 3 >= n:  # malformed / truncated data — stop safely
+                i = n
+                break
+            bone_index = int(vertices[i])
+            vx = vertices[i + 1]
+            vy = vertices[i + 2]
+            weight = vertices[i + 3]
+            i += 4
+            bt = bone_transforms[bone_index] if 0 <= bone_index < n_bones else None
+            if bt is None:
+                continue
+            wx += (bt.a * vx + bt.b * vy + bt.worldX) * weight
+            wy += (bt.c * vx + bt.d * vy + bt.worldY) * weight
+        out.append(wx)
+        out.append(wy)
+    return out
+
+
 def clip_end_marker_after_slot(att_name: str | None, att_data: dict | None) -> bool:
     """Return True when a clip end marker must be emitted after this slot.
 

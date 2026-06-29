@@ -208,15 +208,19 @@ def _render_item(painter, item, world_transforms, cx, cy, zoom,
 
     # -- clipping attachment --
     if item_type == "clip":
+        world_space = item.get("world_space", False)
         bt = world_transforms.get(item["bone"])
-        if bt is None:
+        if bt is None and not world_space:
             return clip_end, active_clip_path
         verts = item["vertices"]
         points = []
-        for vi in range(0, len(verts), 2):
+        for vi in range(0, len(verts) - 1, 2):
             lx, ly = verts[vi], verts[vi + 1]
-            wx = bt.a * lx + bt.b * ly + bt.worldX
-            wy = bt.c * lx + bt.d * ly + bt.worldY
+            if world_space:
+                wx, wy = lx, ly
+            else:
+                wx = bt.a * lx + bt.b * ly + bt.worldX
+                wy = bt.c * lx + bt.d * ly + bt.worldY
             sx = cx + wx * zoom
             sy = cy - wy * zoom
             points.append(QPointF(sx, sy))
@@ -231,8 +235,9 @@ def _render_item(painter, item, world_transforms, cx, cy, zoom,
 
     # -- mesh attachment --
     if item_type == "mesh":
+        world_space = item.get("world_space", False)
         bt = world_transforms.get(item["bone"])
-        if bt is None:
+        if bt is None and not world_space:
             return clip_end, active_clip_path
 
         verts = item["vertices"]
@@ -246,10 +251,13 @@ def _render_item(painter, item, world_transforms, cx, cy, zoom,
             painter.setOpacity(color[3])
 
         screen_pts = []
-        for vi in range(0, len(verts), 2):
+        for vi in range(0, len(verts) - 1, 2):
             lx, ly = verts[vi], verts[vi + 1]
-            wx = bt.a * lx + bt.b * ly + bt.worldX
-            wy = bt.c * lx + bt.d * ly + bt.worldY
+            if world_space:
+                wx, wy = lx, ly
+            else:
+                wx = bt.a * lx + bt.b * ly + bt.worldX
+                wy = bt.c * lx + bt.d * ly + bt.worldY
             screen_pts.append((cx + wx * zoom, cy - wy * zoom))
 
         uv_pts = [(uvs[ui] * pw, uvs[ui + 1] * ph)

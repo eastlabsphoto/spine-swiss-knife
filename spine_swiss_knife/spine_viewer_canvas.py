@@ -236,15 +236,19 @@ class SpineGLCanvas(QOpenGLWidget):
 
             # Start clipping mask
             if item_type == "clip":
+                world_space = item.get("world_space", False)
                 bt = self._world_transforms.get(item["bone"])
-                if bt is None:
+                if bt is None and not world_space:
                     continue
                 verts = item["vertices"]
                 points = []
-                for i in range(0, len(verts), 2):
+                for i in range(0, len(verts) - 1, 2):
                     lx, ly = verts[i], verts[i + 1]
-                    wx = bt.a * lx + bt.b * ly + bt.worldX
-                    wy = bt.c * lx + bt.d * ly + bt.worldY
+                    if world_space:
+                        wx, wy = lx, ly
+                    else:
+                        wx = bt.a * lx + bt.b * ly + bt.worldX
+                        wy = bt.c * lx + bt.d * ly + bt.worldY
                     sx = cx + wx * flip_sx * effective_zoom
                     sy = cy - wy * flip_sy * effective_zoom
                     points.append(QPointF(sx, sy))
@@ -259,8 +263,9 @@ class SpineGLCanvas(QOpenGLWidget):
 
             # Render mesh attachment
             if item_type == "mesh":
+                world_space = item.get("world_space", False)
                 bt = self._world_transforms.get(item["bone"])
-                if bt is None:
+                if bt is None and not world_space:
                     continue
                 verts = item["vertices"]
                 uvs = item["uvs"]
@@ -278,10 +283,13 @@ class SpineGLCanvas(QOpenGLWidget):
 
                 # Pre-compute screen-space vertex positions
                 screen_pts = []
-                for i in range(0, len(verts), 2):
+                for i in range(0, len(verts) - 1, 2):
                     lx, ly = verts[i], verts[i + 1]
-                    wx = bt.a * lx + bt.b * ly + bt.worldX
-                    wy = bt.c * lx + bt.d * ly + bt.worldY
+                    if world_space:
+                        wx, wy = lx, ly
+                    else:
+                        wx = bt.a * lx + bt.b * ly + bt.worldX
+                        wy = bt.c * lx + bt.d * ly + bt.worldY
                     screen_pts.append((cx + wx * flip_sx * effective_zoom,
                                        cy - wy * flip_sy * effective_zoom))
 
