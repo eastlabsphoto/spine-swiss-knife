@@ -4,6 +4,8 @@ Supports Spine .atlas files and TexturePacker JSON format.
 Requires Pillow (PIL) for image processing.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import sys
@@ -16,6 +18,8 @@ from PySide6.QtGui import QTextCharFormat, QTextCursor, QColor, QFont, QPixmap
 from PySide6.QtCore import Qt
 
 from .i18n import tr, language_changed
+from .atlas_parser import parse_atlas_pages
+from .spine_json import image_key_from_path
 
 try:
     from PIL import Image
@@ -29,85 +33,60 @@ except ImportError:
 # ==========================================================================
 
 def parse_spine_atlas(atlas_path: str) -> list[tuple[str, list[dict], float]]:
-    with open(atlas_path, "r") as f:
-        lines = f.readlines()
+    """Parse a Spine atlas (3.x and 4.x) into ``[(page_image, frames, page_scale)]``.
 
-    pages: list[tuple[str, list[dict]]] = []
-    current_image = None
-    current_frames: list[dict] = []
-    current_frame: dict | None = None
-    current_page_scale: float = 1.0
-
-    i = 0
-    while i < len(lines):
-        raw = lines[i].rstrip("\n\r")
-        stripped = raw.strip()
-        i += 1
-
-        if not stripped:
-            if current_frame:
-                current_frames.append(current_frame)
-                current_frame = None
-            if current_image and current_frames:
-                pages.append((current_image, current_frames, current_page_scale))
-            current_image = None
-            current_frames = []
-            current_page_scale = 1.0
-            continue
-
-        if current_image is None:
-            if ":" not in stripped:
-                current_image = stripped
-            continue
-
-        if raw[0] in (' ', '\t'):
-            if current_frame and ":" in stripped:
-                key, value = [x.strip() for x in stripped.split(":", 1)]
-                if key == "xy":
-                    x, y = map(int, value.split(","))
-                    current_frame["x"] = x
-                    current_frame["y"] = y
-                elif key == "size":
-                    w, h = map(int, value.split(","))
-                    current_frame["w"] = w
-                    current_frame["h"] = h
-                elif key == "orig":
-                    w, h = map(int, value.split(","))
-                    current_frame["orig_w"] = w
-                    current_frame["orig_h"] = h
-                elif key == "offset":
-                    x, y = map(int, value.split(","))
-                    current_frame["offset_x"] = x
-                    current_frame["offset_y"] = y
-                elif key == "rotate":
-                    current_frame["rotate"] = value.lower() in ("true", "90")
-                elif key == "index":
-                    try:
-                        current_frame["index"] = int(value)
-                    except ValueError:
-                        pass
-            elif ":" in stripped:
-                pass
-        else:
-            if ":" in stripped and not current_frames and current_frame is None:
-                # Page-level property (size, format, filter, scale, etc.)
-                key, value = [x.strip() for x in stripped.split(":", 1)]
-                if key == "scale":
-                    try:
-                        current_page_scale = float(value)
-                    except ValueError:
-                        pass
-                continue
-            if current_frame:
-                current_frames.append(current_frame)
-            current_frame = {"filename": stripped}
-
-    if current_frame:
-        current_frames.append(current_frame)
-    if current_image and current_frames:
-        pages.append((current_image, current_frames, current_page_scale))
-
+    Frame dict keys: filename (region name, never stripped), x, y, w, h (unrotated),
+    orig_w, orig_h, offset_x, offset_y, rotate (bool), index (-1 = none).
+    """
+    pages: list[tuple[str, list[dict], float]] = []
+    for page in parse_atlas_pages(atlas_path):
+        frames = []
+        for r in page["regions"]:
+            frames.append({
+                "filename": r["name"],
+                "x": r["x"], "y": r["y"], "w": r["w"], "h": r["h"],
+                "orig_w": r["orig_w"], "orig_h": r["orig_h"],
+                "offset_x": r["offset_x"], "offset_y": r["offset_y"],
+                "rotate": bool(r["rotate"]), "index": r["index"],
+            })
+        if frames:
+            pages.append((page["name"], frames, page["scale"]))
     return pages
+
+
+def frame_output_name(frame: dict) -> str:
+    """Relative output name (without extension) of an atlas frame.
+
+    Region names are kept verbatim (they have no extension and may contain dots);
+    indexed regions get the original ``_<index>`` file suffix.
+    """
+    name = frame["filename"]
+    index = frame.get("index", -1)
+    if isinstance(index, int) and index >= 0:
+        name = "%s_%d" % (name, index)
+    return name
+
+
+def _safe_output_path(output_dir: str, base: str) -> str | None:
+    """output_dir/<base>.png, or None when ``base`` would escape output_dir."""
+    out_path = os.path.normpath(os.path.join(output_dir, base + ".png"))
+    root = os.path.normpath(os.path.abspath(output_dir))
+    if not os.path.abspath(out_path).startswith(root + os.sep):
+        return None
+    return out_path
+
+
+def _save_image(img, output_dir: str, base: str) -> bool:
+    out_path = _safe_output_path(output_dir, base)
+    if out_path is None:
+        return False
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    img.save(out_path)
+    return True
+
+
+def _strip_image_ext(filename: str) -> str:
+    return image_key_from_path(filename)
 
 
 # ==========================================================================
@@ -140,6 +119,8 @@ def extract_spine_frames(atlas_path: str, output_dir: str) -> int:
             if w == 0 or h == 0:
                 continue
             if rotated:
+                # Rotated regions occupy h x w on the page, stored 90 deg CCW:
+                # rotate the piece 90 deg clockwise to restore it.
                 frame_image = atlas_image.crop((x, y, x + h, y + w))
                 frame_image = frame_image.rotate(-90, expand=True)
             else:
@@ -148,13 +129,70 @@ def extract_spine_frames(atlas_path: str, output_dir: str) -> int:
             paste_y = max(0, orig_h - frame_image.height - offset_y)
             # libGDX/Spine atlas offsetY is measured from the bottom edge.
             restored.paste(frame_image, (offset_x, paste_y))
-            base = os.path.splitext(frame["filename"])[0]
-            out_path = os.path.join(output_dir, f"{base}.png")
-            os.makedirs(os.path.dirname(out_path), exist_ok=True)
-            restored.save(out_path)
-            count += 1
+            if _save_image(restored, output_dir, frame_output_name(frame)):
+                count += 1
 
     return count
+
+
+def _iter_tp_frames(frames):
+    """Yield (filename, frame) for TexturePacker "frames" given as dict or list."""
+    if isinstance(frames, dict):
+        for filename, frame in frames.items():
+            yield filename, frame
+    elif isinstance(frames, list):
+        for frame in frames:
+            if isinstance(frame, dict) and "filename" in frame:
+                yield frame["filename"], frame
+
+
+def _tp_crop_size(frame: dict) -> tuple[int, int]:
+    """(width, height) of the rectangle a TexturePacker frame occupies on the sheet.
+
+    Rotated frames are stored turned by 90 degrees, so the sheet rectangle is the
+    sprite size with width and height swapped.  Some exporters already list the
+    swapped size in ``frame``; ``spriteSourceSize`` tells the two apart.
+    """
+    fd = frame["frame"]
+    w, h = fd["w"], fd["h"]
+    if not frame.get("rotated"):
+        return w, h
+    sss = frame.get("spriteSourceSize") or {}
+    if (sss.get("w"), sss.get("h")) == (h, w) and w != h:
+        return w, h  # already the swapped (sheet) size
+    return h, w
+
+
+def _tp_extract_one(atlas_image, frame: dict):
+    """Return (restored_image, skip_reason) for one TexturePacker frame."""
+    fd = frame["frame"]
+    ss = frame.get("sourceSize") or {"w": fd["w"], "h": fd["h"]}
+    sss = frame.get("spriteSourceSize") or {"x": 0, "y": 0}
+    rotated = bool(frame.get("rotated"))
+    aw, ah = atlas_image.size
+    cw, ch = _tp_crop_size(frame)
+    x0, y0 = fd["x"], fd["y"]
+    x1, y1 = x0 + cw, y0 + ch
+    x0c = min(max(x0, 0), aw)
+    y0c = min(max(y0, 0), ah)
+    x1c = min(max(x1, 0), aw)
+    y1c = min(max(y1, 0), ah)
+    if x1c <= x0c or y1c <= y0c:
+        return None, "region outside image bounds"
+    if rotated and (x0c, y0c, x1c, y1c) == (x0, y0, x1, y1):
+        piece = atlas_image.crop((x0, y0, x1, y1))
+        # TexturePacker rotates 90 deg clockwise: undo counter-clockwise.
+        piece = piece.rotate(90, expand=True)
+        pasted_x, pasted_y = sss.get("x", 0), sss.get("y", 0)
+    elif rotated:
+        return None, "rotated region partly outside image bounds"
+    else:
+        piece = atlas_image.crop((x0c, y0c, x1c, y1c))
+        pasted_x = sss.get("x", 0) + (x0c - x0)
+        pasted_y = sss.get("y", 0) + (y0c - y0)
+    restored = Image.new("RGBA", (ss["w"], ss["h"]), (0, 0, 0, 0))
+    restored.paste(piece, (pasted_x, pasted_y))
+    return restored, None
 
 
 def extract_json_frames(data: dict, output_dir: str, json_path: str):
@@ -164,30 +202,13 @@ def extract_json_frames(data: dict, output_dir: str, json_path: str):
         for texture in data["textures"]:
             image_path = os.path.join(os.path.dirname(json_path), texture["image"])
             atlas_image = Image.open(image_path).convert("RGBA")
-            aw, ah = atlas_image.size
-            for frame in texture["frames"]:
-                fd = frame["frame"]
-                ss = frame["sourceSize"]
-                sss = frame["spriteSourceSize"]
-                x0, y0 = fd["x"], fd["y"]
-                x1, y1 = x0 + fd["w"], y0 + fd["h"]
-                x0c = min(max(x0, 0), aw)
-                y0c = min(max(y0, 0), ah)
-                x1c = min(max(x1, 0), aw)
-                y1c = min(max(y1, 0), ah)
-                if x1c <= x0c or y1c <= y0c:
-                    warnings.append(f"Skipped '{frame['filename']}': region outside image bounds.")
+            for filename, frame in _iter_tp_frames(texture["frames"]):
+                restored, reason = _tp_extract_one(atlas_image, frame)
+                if restored is None:
+                    warnings.append(f"Skipped '{filename}': {reason}.")
                     continue
-                frame_img = atlas_image.crop((x0c, y0c, x1c, y1c))
-                restored = Image.new("RGBA", (ss["w"], ss["h"]), (0, 0, 0, 0))
-                paste_x = sss["x"] + (x0c - x0)
-                paste_y = sss["y"] + (y0c - y0)
-                restored.paste(frame_img, (paste_x, paste_y))
-                base = os.path.splitext(frame["filename"])[0]
-                out_path = os.path.join(output_dir, f"{base}.png")
-                os.makedirs(os.path.dirname(out_path), exist_ok=True)
-                restored.save(out_path)
-                count += 1
+                if _save_image(restored, output_dir, _strip_image_ext(filename)):
+                    count += 1
     elif "frames" in data:
         meta = data["meta"]
         json_dir = os.path.dirname(json_path)
@@ -202,12 +223,13 @@ def extract_json_frames(data: dict, output_dir: str, json_path: str):
         meta_size = meta.get("size", {})
         mw, mh = meta_size.get("w", aw), meta_size.get("h", ah)
         size_match = (aw, ah) == (mw, mh)
+        items = list(_iter_tp_frames(data["frames"]))
 
         if not size_match:
             # Derive grid layout from JSON frame coordinates, then
             # re-map to actual image dimensions.
-            xs = sorted({f["frame"]["x"] for f in data["frames"].values()})
-            ys = sorted({f["frame"]["y"] for f in data["frames"].values()})
+            xs = sorted({f["frame"]["x"] for _n, f in items})
+            ys = sorted({f["frame"]["y"] for _n, f in items})
             cols = len(xs)
             rows = len(ys)
             cell_w = aw / cols
@@ -219,7 +241,7 @@ def extract_json_frames(data: dict, output_dir: str, json_path: str):
                 f"Using grid extraction: {rows} rows x {cols} cols, "
                 f"cell ~{cell_w:.0f}x{cell_h:.0f}px."
             )
-            for filename, frame in data["frames"].items():
+            for filename, frame in items:
                 fd = frame["frame"]
                 col = x_to_col[fd["x"]]
                 row = y_to_row[fd["y"]]
@@ -228,26 +250,16 @@ def extract_json_frames(data: dict, output_dir: str, json_path: str):
                 x1 = round((col + 1) * cell_w)
                 y1 = round((row + 1) * cell_h)
                 frame_img = atlas_image.crop((x0, y0, x1, y1))
-                base = os.path.splitext(filename)[0]
-                out_path = os.path.join(output_dir, f"{base}.png")
-                os.makedirs(os.path.dirname(out_path), exist_ok=True)
-                frame_img.save(out_path)
-                count += 1
+                if _save_image(frame_img, output_dir, _strip_image_ext(filename)):
+                    count += 1
         else:
-            for filename, frame in data["frames"].items():
-                fd = frame["frame"]
-                ss = frame["sourceSize"]
-                sss = frame["spriteSourceSize"]
-                frame_img = atlas_image.crop(
-                    (fd["x"], fd["y"], fd["x"] + fd["w"], fd["y"] + fd["h"])
-                )
-                restored = Image.new("RGBA", (ss["w"], ss["h"]), (0, 0, 0, 0))
-                restored.paste(frame_img, (sss["x"], sss["y"]))
-                base = os.path.splitext(filename)[0]
-                out_path = os.path.join(output_dir, f"{base}.png")
-                os.makedirs(os.path.dirname(out_path), exist_ok=True)
-                restored.save(out_path)
-                count += 1
+            for filename, frame in items:
+                restored, reason = _tp_extract_one(atlas_image, frame)
+                if restored is None:
+                    warnings.append(f"Skipped '{filename}': {reason}.")
+                    continue
+                if _save_image(restored, output_dir, _strip_image_ext(filename)):
+                    count += 1
     return count, warnings
 
 
@@ -329,7 +341,10 @@ class TextureUnpackerTab:
         if atlas and os.path.isfile(atlas):
             self._file_edit.setText(atlas)
             self._auto_output(atlas)
-            self._preview_atlas(atlas)
+            try:
+                self._preview_atlas(atlas)
+            except Exception:
+                pass
 
         language_changed.connect(self._retranslate)
 
@@ -379,7 +394,10 @@ class TextureUnpackerTab:
         if path:
             self._file_edit.setText(path)
             self._auto_output(path)
-            self._preview_atlas(path)
+            try:
+                self._preview_atlas(path)
+            except Exception:
+                pass
 
     def _browse_output(self):
         path = QFileDialog.getExistingDirectory(None, tr("unpacker.dialog.select_output"))
@@ -420,7 +438,7 @@ class TextureUnpackerTab:
                 self._append(tr("unpacker.log.format_spine"))
                 count = extract_spine_frames(file_path, output_dir)
             elif ext == ".json":
-                with open(file_path, "r") as f:
+                with open(file_path, "r", encoding="utf-8-sig") as f:
                     data = json.load(f)
                 if "textures" in data:
                     self._append(tr("unpacker.log.format_tp_textures"))
@@ -455,7 +473,10 @@ class TextureUnpackerTab:
         if file_path.lower().endswith(".atlas.txt"):
             ext = ".atlas"
         if ext == ".atlas":
-            pages = parse_spine_atlas(file_path)
+            try:
+                pages = parse_spine_atlas(file_path)
+            except Exception:
+                pages = []
             atlas_dir = os.path.dirname(file_path)
             for img_name, frames, _scale in pages:
                 img_path = os.path.join(atlas_dir, img_name)
@@ -471,7 +492,7 @@ class TextureUnpackerTab:
                 self._preview_layout.addWidget(lbl)
         elif ext == ".json":
             try:
-                with open(file_path, "r") as f:
+                with open(file_path, "r", encoding="utf-8-sig") as f:
                     data = json.load(f)
                 json_dir = os.path.dirname(file_path)
                 images = []
@@ -510,7 +531,10 @@ class TextureUnpackerTab:
         if atlas_path.lower().endswith(".atlas.txt"):
             ext = ".atlas"
         if ext == ".atlas":
-            pages = parse_spine_atlas(atlas_path)
+            try:
+                pages = parse_spine_atlas(atlas_path)
+            except Exception:
+                pages = []
             if pages:
                 img_name = pages[0][0]
                 img_path = os.path.join(os.path.dirname(atlas_path), img_name)

@@ -1,5 +1,7 @@
 """Unused Finder tab — find images on disk not referenced in atlas."""
 
+from __future__ import annotations
+
 import os
 import shutil
 
@@ -10,7 +12,10 @@ from PySide6.QtWidgets import (
 )
 
 from .i18n import tr, language_changed
+from .debug_log import log_error
 from .atlas_parser import parse_atlas, collect_images
+from .spine_json import load_spine_json
+from .unused_core import compare_images, json_image_keys
 
 
 class UnusedFinderTab:
@@ -94,22 +99,45 @@ class UnusedFinderTab:
         self._used_tree.setHeaderLabels([tr("unused.tree.used")])
         self._missing_tree.setHeaderLabels([tr("unused.tree.missing")])
 
-    def _analyze(self):
+    def _analyze(self, silent=False):
+        """Compare images on disk with the atlas / JSON.
+
+        *silent* (automatic refresh) returns quietly when the configuration is
+        incomplete or unreadable instead of showing error dialogs.
+        """
         atlas_path = self._get_config("atlas")
+        json_path = self._get_config("json")
         images_dir = self._get_config("images")
-        if not atlas_path or not os.path.isfile(atlas_path):
-            QMessageBox.critical(None, tr("err.title"), tr("err.no_atlas"))
+        has_atlas = bool(atlas_path) and os.path.isfile(atlas_path)
+        has_json = bool(json_path) and os.path.isfile(json_path)
+        if not has_atlas and not has_json:
+            if not silent:
+                QMessageBox.critical(None, tr("err.title"), tr("err.no_atlas"))
             return
         if not images_dir or not os.path.isdir(images_dir):
-            QMessageBox.critical(None, tr("err.title"), tr("err.no_images"))
+            if not silent:
+                QMessageBox.critical(None, tr("err.title"), tr("err.no_images"))
             return
 
-        atlas_sprites = parse_atlas(atlas_path)
+        atlas_sprites = None
+        json_keys = None
+        try:
+            if has_atlas:
+                atlas_sprites = parse_atlas(atlas_path)
+            if has_json:
+                json_keys = json_image_keys(load_spine_json(json_path))
+        except Exception as e:
+            if silent:
+                log_error("Unused finder: %s" % e)
+            else:
+                QMessageBox.critical(None, tr("err.title"), str(e))
+            return
+
         all_images = collect_images(images_dir)
-        image_names = set(all_images.keys())
-        used_names = image_names & atlas_sprites
-        unused_names = image_names - atlas_sprites
-        missing = atlas_sprites - image_names
+        cmp = compare_images(all_images.keys(), atlas_sprites, json_keys)
+        used_names = cmp["used"]
+        unused_names = cmp["unused"]
+        missing = cmp["missing"]
 
         self._unused_images = {k: all_images[k] for k in sorted(unused_names)}
         self._unused_names_ordered = sorted(unused_names)
@@ -170,6 +198,9 @@ class UnusedFinderTab:
             rel = os.path.relpath(src_path, images_dir)
             dst_path = os.path.join(unused_dir, rel)
             os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+            if os.path.exists(dst_path):
+                errors.append(f"{rel}: destination exists in _UNUSED")
+                continue
             try:
                 shutil.move(src_path, dst_path)
                 moved += 1

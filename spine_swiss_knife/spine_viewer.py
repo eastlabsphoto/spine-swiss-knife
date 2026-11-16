@@ -1,8 +1,13 @@
 """Spine Skeleton Viewer tab — interactive skeleton preview with animation."""
 
+from __future__ import annotations
+
+import atexit
 import os
 import platform
+import re as _re
 import subprocess
+from xml.sax.saxutils import escape as xml_escape
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
@@ -12,8 +17,9 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap
 
-from .spine_json import load_spine_json, normalize_skins
+from .spine_json import load_spine_json, normalize_skins, spine_version
 from .i18n import tr, language_changed
+from .debug_log import log_error
 
 # Re-export from new modules for backward compatibility
 from .spine_viewer_animation import (  # noqa: F401
@@ -23,6 +29,47 @@ from .spine_viewer_animation import (  # noqa: F401
     _color_to_floats, load_atlas_textures,
 )
 from .spine_viewer_canvas import SpineGLCanvas  # noqa: F401
+
+
+# ==========================================================================
+# Bundled Java viewer helpers
+# ==========================================================================
+
+_java_viewer: dict = {"proc": None}
+
+
+def _terminate_java_viewer() -> None:
+    proc = _java_viewer.get("proc")
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    _java_viewer["proc"] = None
+
+
+atexit.register(_terminate_java_viewer)
+
+
+def set_last_file_entry(text: str, json_path: str) -> str:
+    """Return java-properties XML ``text`` with the ``lastFile`` entry set to
+    ``json_path`` (XML-escaped; no regex replacement string is involved)."""
+    entry = '<entry key="lastFile">%s</entry>' % xml_escape(json_path)
+    if '<entry key="lastFile">' in text:
+        return _re.sub(r'<entry key="lastFile">[^<]*</entry>',
+                       lambda m: entry, text)
+    if "</properties>" in text:
+        return text.replace("</properties>", entry + "\n</properties>", 1)
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE properties SYSTEM "http://java.sun.com/dtd/properties.dtd">\n'
+        "<properties>\n" + entry + "\n</properties>\n"
+    )
+
+
+def full_viewer_supported(spine_data) -> bool:
+    """The bundled viewer is Spine 3.6.x only."""
+    return spine_version(spine_data or {})[:2] == (3, 6)
 
 
 # ==========================================================================
@@ -176,11 +223,28 @@ class SpineViewerTab:
 
         language_changed.connect(self._retranslate)
 
+    @staticmethod
+    def _viewer_alive() -> bool:
+        proc = _java_viewer.get("proc")
+        return proc is not None and proc.poll() is None
+
+    def _update_full_button(self):
+        """The bundled viewer only reads Spine 3.6.x data."""
+        data = self._spine_data
+        if data is None or full_viewer_supported(data):
+            self._btn_full.setEnabled(True)
+            self._btn_full.setToolTip("")
+        else:
+            raw = (data.get("skeleton") or {}).get("spine", "?")
+            self._btn_full.setEnabled(False)
+            self._btn_full.setToolTip(tr("viewer.open_full_unsupported", version=raw))
+
     def _retranslate(self):
         idx = self._tabs.indexOf(self._page)
         if idx >= 0:
             self._tabs.setTabText(idx, tr("viewer.tab"))
         self._btn_full.setText(tr("viewer.open_full"))
+        self._update_full_button()
         if self._spine_data is None:
             self._stats.setText(tr("viewer.default_stats"))
         self._scale_title.setText(tr("viewer.scale_label"))
@@ -305,34 +369,22 @@ class SpineViewerTab:
             QMessageBox.critical(None, tr("err.title"), tr("viewer.err.no_atlas"))
             return
 
+        if self._viewer_alive():
+            QMessageBox.information(None, tr("err.title"), tr("viewer.err.already_running"))
+            return
+
         # Write JSON path into viewer preferences so it auto-loads
         prefs_path = os.path.expanduser("~/.prefs/spine-skeletonviewer")
         try:
-            import re as _re
             if os.path.isfile(prefs_path):
-                text = open(prefs_path, "r", encoding="utf-8").read()
-                # Replace existing lastFile entry
-                if '<entry key="lastFile">' in text:
-                    text = _re.sub(
-                        r'<entry key="lastFile">[^<]*</entry>',
-                        f'<entry key="lastFile">{json_path}</entry>',
-                        text,
-                    )
-                else:
-                    # Insert before </properties>
-                    text = text.replace(
-                        "</properties>",
-                        f'<entry key="lastFile">{json_path}</entry>\n</properties>',
-                    )
-                open(prefs_path, "w", encoding="utf-8").write(text)
+                with open(prefs_path, "r", encoding="utf-8") as f:
+                    text = f.read()
+                text = set_last_file_entry(text, json_path)
             else:
                 os.makedirs(os.path.dirname(prefs_path), exist_ok=True)
-                with open(prefs_path, "w", encoding="utf-8") as f:
-                    f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
-                    f.write('<!DOCTYPE properties SYSTEM "http://java.sun.com/dtd/properties.dtd">\n')
-                    f.write("<properties>\n")
-                    f.write(f'<entry key="lastFile">{json_path}</entry>\n')
-                    f.write("</properties>\n")
+                text = set_last_file_entry("", json_path)
+            with open(prefs_path, "w", encoding="utf-8") as f:
+                f.write(text)
         except Exception:
             pass  # Non-critical — viewer will just open without a file
 
@@ -346,38 +398,47 @@ class SpineViewerTab:
             QMessageBox.critical(None, tr("err.title"), tr("viewer.err.viewer_not_found", path=script))
             return
         try:
-            subprocess.Popen([script, json_path], cwd=viewer_dir)
+            _java_viewer["proc"] = subprocess.Popen([script, json_path], cwd=viewer_dir)
         except Exception as e:
             QMessageBox.critical(None, tr("err.title"), tr("viewer.err.launch_failed", error=e))
 
     # ── Load ──
 
-    def _load(self):
+    def _load(self, silent=False):
+        """Load skeleton + textures; *silent* (automatic refresh) logs problems
+        to the debug console instead of showing dialogs."""
         json_path = self._get_config("json")
         atlas_path = self._get_config("atlas")
 
+        def fail(text):
+            if silent:
+                log_error("Viewer: %s" % text)
+            else:
+                QMessageBox.critical(None, tr("err.title"), text)
+
         if not json_path or not os.path.isfile(json_path):
-            QMessageBox.critical(None, tr("err.title"), tr("err.no_json"))
+            fail(tr("err.no_json"))
             return
         if not atlas_path or not os.path.isfile(atlas_path):
-            QMessageBox.critical(None, tr("err.title"), tr("err.no_atlas"))
+            fail(tr("err.no_atlas"))
             return
 
         try:
             spine_data = load_spine_json(json_path)
         except Exception as e:
-            QMessageBox.critical(None, tr("err.title"), tr("viewer.err.load_json", error=e))
+            fail(tr("viewer.err.load_json", error=e))
             return
 
         try:
             textures = load_atlas_textures(atlas_path)
         except Exception as e:
-            QMessageBox.critical(None, tr("err.title"), tr("viewer.err.load_atlas", error=e))
+            fail(tr("viewer.err.load_atlas", error=e))
             return
 
         self._spine_data = spine_data
         self._textures = textures
         self._canvas.set_base_data(spine_data, textures)
+        self._update_full_button()
 
         # Populate animation list
         animations = spine_data.get("animations", {})

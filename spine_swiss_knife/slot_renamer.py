@@ -2,12 +2,12 @@
 
 Renames every slot by appending its blend mode as a suffix
 (e.g. ``_additive``, ``_normal``).  All references throughout the JSON
-are updated: slots, skins, animations (slot timelines, drawOrder,
-deform), and clipping ``end`` references.
+are updated (see ``spine_refs.rename_slots``).
 """
 
+from __future__ import annotations
+
 import os
-import shutil
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -16,7 +16,8 @@ from PySide6.QtWidgets import (
 )
 
 from .i18n import tr, language_changed
-from .spine_json import load_spine_json, save_spine_json, is_skins_list
+from .spine_json import load_spine_json, save_spine_json, create_backup
+from .spine_refs import find_rename_collisions, rename_slots
 
 
 # ==========================================================================
@@ -62,83 +63,23 @@ def compute_renames(spine_data: dict) -> list[dict]:
     return results
 
 
+def find_collisions(spine_data: dict, rename_map: dict[str, str]) -> list[str]:
+    """English messages describing name collisions of *rename_map* (empty if none)."""
+    return find_rename_collisions(spine_data, rename_map)
+
+
 def apply_renames(spine_data: dict, rename_map: dict[str, str]):
     """Rename slots throughout *spine_data* according to *rename_map*.
 
-    *rename_map* maps old slot name -> new slot name.
-    Updates all six reference locations in place.
+    *rename_map* maps old slot name -> new slot name. The rename is
+    simultaneous (chains and swaps are legal) and updates every reference
+    (slots, skins, clipping ``end``, path constraint targets, slot / draw
+    order / deform / 4.1+ attachment timelines). Raises ``ValueError`` on
+    collisions (see :func:`find_collisions`).
     """
     if not rename_map:
         return
-
-    # 1. slots[].name
-    for slot in spine_data.get("slots", []):
-        old = slot.get("name", "")
-        if old in rename_map:
-            slot["name"] = rename_map[old]
-
-    # 2. skins — slot name is used as dict key
-    if is_skins_list(spine_data):
-        for skin in spine_data.get("skins", []):
-            _rename_skin_slots(skin.get("attachments", {}), rename_map)
-    else:
-        for skin_name, skin_data in spine_data.get("skins", {}).items():
-            _rename_skin_slots(skin_data, rename_map)
-
-    # 3 + 4 + 5. animations — slots, drawOrder, deform
-    for anim_name, anim in spine_data.get("animations", {}).items():
-        # 3. slot timelines
-        if "slots" in anim:
-            anim["slots"] = _rename_dict_keys(anim["slots"], rename_map)
-        # 4. drawOrder offsets
-        for entry in anim.get("drawOrder", []):
-            for offset in entry.get("offsets", []):
-                old = offset.get("slot", "")
-                if old in rename_map:
-                    offset["slot"] = rename_map[old]
-        # 5. deform — slot name is a key (nested under skin name)
-        if "deform" in anim:
-            for skin_name, skin_deform in anim["deform"].items():
-                anim["deform"][skin_name] = _rename_dict_keys(
-                    skin_deform, rename_map)
-
-    # 6. clipping "end" references in skins
-    if is_skins_list(spine_data):
-        for skin in spine_data.get("skins", []):
-            _rename_clipping_ends(skin.get("attachments", {}), rename_map)
-    else:
-        for skin_name, skin_data in spine_data.get("skins", {}).items():
-            _rename_clipping_ends(skin_data, rename_map)
-
-
-def _rename_dict_keys(d: dict, rename_map: dict[str, str]) -> dict:
-    """Return a new dict with keys renamed according to *rename_map*."""
-    new = {}
-    for key, value in d.items():
-        new_key = rename_map.get(key, key)
-        new[new_key] = value
-    return new
-
-
-def _rename_skin_slots(skin_data: dict, rename_map: dict[str, str]):
-    """Rename slot keys in a skin attachments dict in place."""
-    keys_to_rename = [k for k in skin_data if k in rename_map]
-    for old_key in keys_to_rename:
-        skin_data[rename_map[old_key]] = skin_data.pop(old_key)
-
-
-def _rename_clipping_ends(skin_data: dict, rename_map: dict[str, str]):
-    """Update clipping attachment 'end' values in a skin dict."""
-    for slot_atts in skin_data.values():
-        if not isinstance(slot_atts, dict):
-            continue
-        for att_data in slot_atts.values():
-            if not isinstance(att_data, dict):
-                continue
-            if att_data.get("type") == "clipping":
-                end = att_data.get("end", "")
-                if end in rename_map:
-                    att_data["end"] = rename_map[end]
+    rename_slots(spine_data, rename_map)
 
 
 # ==========================================================================
@@ -262,7 +203,6 @@ class SlotRenamerTab:
             return
 
         try:
-            shutil.copy2(json_path, backup_path)
             spine_data = load_spine_json(json_path)
         except Exception as e:
             QMessageBox.critical(None, tr("err.title"),
@@ -270,9 +210,17 @@ class SlotRenamerTab:
             return
 
         rename_map = dict(checked)
-        apply_renames(spine_data, rename_map)
+        collisions = find_collisions(spine_data, rename_map)
+        if collisions:
+            QMessageBox.critical(
+                None, tr("err.title"),
+                tr("renamer.err.collisions",
+                   details="\n".join(collisions)))
+            return
 
         try:
+            apply_renames(spine_data, rename_map)
+            create_backup(json_path)
             save_spine_json(json_path, spine_data)
         except Exception as e:
             QMessageBox.critical(None, tr("err.title"),

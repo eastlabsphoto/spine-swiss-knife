@@ -4,7 +4,15 @@ from pathlib import Path
 
 import numpy as np
 
+from spine_swiss_knife.spine_refs import apply_draw_order_offsets
+
 from spine_swiss_knife.draw_order_core import (
+    BASELINE_MEMORY_BUDGET,
+    baseline_is_reorder_of,
+    build_reordered_data,
+    plan_baseline_storage,
+    sample_times,
+    sanitize_dir_name,
     DEFAULT_THRESHOLD_PERCENT,
     DEFAULT_TOLERANCE,
     compare_rgba_arrays,
@@ -107,10 +115,11 @@ class VisibleAreaCompareTests(unittest.TestCase):
 class ThresholdDefaultsTests(unittest.TestCase):
     def test_ui_defaults_match_recommended_settings(self):
         self.assertEqual(DEFAULT_TOLERANCE, 6)
-        self.assertAlmostEqual(DEFAULT_THRESHOLD_PERCENT, 0.15)
+        # The default was deliberately raised to 1 % ("threshold default 1%").
+        self.assertAlmostEqual(DEFAULT_THRESHOLD_PERCENT, 1.0)
         self.assertAlmostEqual(
             threshold_percent_to_ratio(DEFAULT_THRESHOLD_PERCENT),
-            0.0015,
+            0.01,
         )
 
 
@@ -140,10 +149,194 @@ class BaselinePathTests(unittest.TestCase):
         baseline, backup, should_create = resolve_baseline_paths(
             "/tmp/test.json",
             backup_exists=True,
+            backup_is_reorder=True,
         )
         self.assertEqual(baseline, "/tmp/test.json.backup")
         self.assertEqual(backup, "/tmp/test.json.backup")
         self.assertFalse(should_create)
+
+    def test_backup_that_is_not_a_reorder_is_not_the_baseline(self):
+        baseline, backup, should_create = resolve_baseline_paths(
+            "/tmp/test.json",
+            backup_exists=True,
+            backup_is_reorder=False,
+        )
+        self.assertEqual(baseline, "/tmp/test.json")
+        self.assertEqual(backup, "/tmp/test.json.backup")
+        self.assertTrue(should_create)
+
+
+def _skeleton(slot_order):
+    slots = {n: {"name": n, "bone": "root", "blend": b}
+             for n, b in (("a", "normal"), ("b", "additive"),
+                          ("c", "normal"), ("d", "additive"))}
+    return {
+        "skeleton": {"spine": "3.8.99"},
+        "bones": [{"name": "root"}],
+        "slots": [dict(slots[n]) for n in slot_order],
+        "skins": [{"name": "default", "attachments": {}}],
+        "animations": {
+            "x": {"bones": {"root": {"rotate": [{"angle": 5}]}},
+                  "drawOrder": [
+                      {"time": 0},
+                      {"time": 0.5, "offsets": [{"slot": "a", "offset": 2}]},
+                  ]},
+        },
+    }
+
+
+class BaselineIsReorderTests(unittest.TestCase):
+    def test_pure_reorder_is_accepted(self):
+        cur = _skeleton("abcd")
+        base = _skeleton("acbd")
+        # draw-order timelines may differ, the rest may not
+        base["animations"]["x"]["drawOrder"] = [{"time": 0.2}]
+        self.assertTrue(baseline_is_reorder_of(cur, base))
+
+    def test_other_changes_are_rejected(self):
+        cur = _skeleton("abcd")
+        base = _skeleton("acbd")
+        base["bones"].append({"name": "extra", "parent": "root"})
+        self.assertFalse(baseline_is_reorder_of(cur, base))
+
+        base = _skeleton("acbd")
+        base["slots"][0]["blend"] = "multiply"
+        self.assertFalse(baseline_is_reorder_of(cur, base))
+
+        base = _skeleton("acbd")
+        base["animations"]["x"]["bones"]["root"]["rotate"][0]["angle"] = 9
+        self.assertFalse(baseline_is_reorder_of(cur, base))
+
+        base = _skeleton("abc")
+        self.assertFalse(baseline_is_reorder_of(cur, base))
+
+    def test_lowercase_draworder_is_ignored(self):
+        cur = _skeleton("abcd")
+        base = _skeleton("acbd")
+        anim = base["animations"]["x"]
+        anim["draworder"] = anim.pop("drawOrder")
+        self.assertTrue(baseline_is_reorder_of(cur, base))
+
+
+class ReorderedDataTests(unittest.TestCase):
+    def _absolute(self, data):
+        names = [s["name"] for s in data["slots"]]
+        out = []
+        for key in data["animations"]["x"]["drawOrder"]:
+            out.append(apply_draw_order_offsets(names, key.get("offsets")))
+        return out
+
+    def test_reorder_keeps_absolute_order_of_every_key(self):
+        data = _skeleton("abcd")
+        data["animations"]["x"]["drawOrder"].append(
+            {"time": 1.0, "offsets": [{"slot": "b", "offset": 1},
+                                      {"slot": "c", "offset": -1}]})
+        before = self._absolute(data)
+        new_slots = [data["slots"][i] for i in (0, 2, 1, 3)]
+        for deep in (False, True):
+            out = build_reordered_data(data, new_slots, deep=deep)
+            self.assertEqual([s["name"] for s in out["slots"]], list("acbd"))
+            self.assertEqual(self._absolute(out), before)
+        # the input was not modified
+        self.assertEqual([s["name"] for s in data["slots"]], list("abcd"))
+        self.assertEqual(self._absolute(data), before)
+
+    def test_time_before_first_key_keeps_old_setup_order(self):
+        data = _skeleton("abcd")
+        data["animations"]["x"]["drawOrder"] = [
+            {"time": 0.5, "offsets": [{"slot": "a", "offset": 2}]}]
+        out = build_reordered_data(
+            data, [data["slots"][i] for i in (0, 2, 1, 3)])
+        keys = out["animations"]["x"]["drawOrder"]
+        self.assertEqual(keys[0]["time"], 0)
+        names = list("acbd")
+        self.assertEqual(apply_draw_order_offsets(names, keys[0]["offsets"]),
+                         list("abcd"))
+        self.assertEqual(apply_draw_order_offsets(names, keys[1]["offsets"]),
+                         ["b", "c", "a", "d"])
+
+    def test_lowercase_draworder_is_rewritten(self):
+        data = _skeleton("abcd")
+        anim = data["animations"]["x"]
+        anim["draworder"] = anim.pop("drawOrder")
+        names = list("abcd")
+        before = [apply_draw_order_offsets(names, k.get("offsets"))
+                  for k in anim["draworder"]]
+        out = build_reordered_data(
+            data, [data["slots"][i] for i in (0, 2, 1, 3)])
+        new_names = list("acbd")
+        after = [apply_draw_order_offsets(new_names, k.get("offsets"))
+                 for k in out["animations"]["x"]["draworder"]]
+        self.assertEqual(after, before)
+
+
+class SamplingAndStorageTests(unittest.TestCase):
+    def test_last_sample_is_exactly_the_duration(self):
+        for dur in (1.0, 0.5, 0.52, 2.0 / 3):
+            times = sample_times(dur, 60)
+            self.assertEqual(times[0], 0.0)
+            self.assertEqual(times[-1], dur)
+            self.assertEqual(len(times), len(set(times)))
+
+    def test_small_job_stays_in_memory_at_requested_fps(self):
+        fps, mode, est = plan_baseline_storage([1.0, 2.0], 1, 256, 256, 60)
+        self.assertEqual((fps, mode), (60, "memory"))
+        self.assertLess(est, BASELINE_MEMORY_BUDGET)
+
+    def test_fps_is_lowered_stepwise_then_spilled(self):
+        # 1500x1500, 20 animations x 2 s, 1 skin
+        durations = [2.0] * 20
+        fps, mode, _ = plan_baseline_storage(durations, 1, 1500, 1500, 60,
+                                             budget=int(8e9))
+        self.assertEqual((fps, mode), (20, "memory"))
+        fps, mode, est = plan_baseline_storage(durations, 1, 1500, 1500, 60)
+        self.assertEqual((fps, mode), (15, "disk"))
+        self.assertGreater(est, BASELINE_MEMORY_BUDGET)
+
+
+class DirNameTests(unittest.TestCase):
+    def test_names_are_sanitised_and_distinct_from_setup_pose(self):
+        for raw in ("win?", "idle: loop", "a/b", "x. ", 'q"<>|*'):
+            name = sanitize_dir_name(raw)
+            self.assertTrue(name.startswith("anim_"))
+            for ch in '/\\:*?"<>|':
+                self.assertNotIn(ch, name)
+            self.assertFalse(name.endswith((".", " ")))
+        self.assertNotEqual(sanitize_dir_name("setup_pose"),
+                            sanitize_dir_name(None))
+
+
+class LocalCompareTests(unittest.TestCase):
+    def _frames(self, x0, y0, size=60):
+        a = np.zeros((1000, 1000, 4), dtype=np.uint8)
+        a[:, :, :] = [200, 200, 200, 255]
+        b = a.copy()
+        b[y0:y0 + size, x0:x0 + size, :] = [0, 0, 0, 255]
+        return a, b
+
+    def test_small_element_change_in_large_area_fails(self):
+        for x0, y0 in ((10, 10), (100, 100), (70, 40), (500, 531)):
+            a, b = self._frames(x0, y0)
+            # 3600 of 1_000_000 px (0.36 %) is below the 1 % global threshold
+            match, stats = compare_rgba_arrays(a, b, tolerance=6, threshold=0.01)
+            self.assertFalse(match, (x0, y0))
+            self.assertLess(stats["bad_pixels"] / stats["visible_pixels"], 0.01)
+
+    def test_identical_and_noisy_frames_still_match(self):
+        a, _ = self._frames(0, 0)
+        match, _ = compare_rgba_arrays(a, a.copy(), tolerance=6, threshold=0.01)
+        self.assertTrue(match)
+        noisy = a.copy()
+        noisy[::7, ::5, 0] += 3  # below tolerance
+        match, _ = compare_rgba_arrays(a, noisy, tolerance=6, threshold=0.01)
+        self.assertTrue(match)
+
+    def test_sparse_edge_pixels_do_not_trip_cell_check(self):
+        a, _ = self._frames(0, 0)
+        b = a.copy()
+        b[::50, ::50, :3] = 0  # 400 isolated pixels, ~1 % of each cell
+        match, _ = compare_rgba_arrays(a, b, tolerance=6, threshold=0.01)
+        self.assertTrue(match)
 
 
 if __name__ == "__main__":

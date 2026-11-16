@@ -12,14 +12,17 @@ uses ``--help`` (always exit 0) instead.
 from __future__ import annotations
 
 import json as _json
+import os
 import platform
 import queue
+import re
+import shutil
 import subprocess
 import tempfile
 import threading
 import time
 import zlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -31,6 +34,9 @@ class SpineCliResult:
     stderr: str = ""
     output_json: str = ""
     output_atlas: str = ""
+    output_jsons: list = field(default_factory=list)
+    output_skels: list = field(default_factory=list)
+    output_atlases: list = field(default_factory=list)
 
 
 def detect_spine_executable() -> Optional[str]:
@@ -142,6 +148,7 @@ def _run_cli(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
         text=True,
     )
 
@@ -167,6 +174,9 @@ def _run_cli(
     try:
         while streams_open > 0:
             if time.monotonic() > deadline:
+                # Collect descendants BEFORE killing the parent, otherwise
+                # they are reparented and can no longer be found.
+                child_pids = _collect_child_pids(proc.pid)
                 proc.kill()
                 t_out.join(timeout=2)
                 t_err.join(timeout=2)
@@ -221,7 +231,7 @@ def _collect_child_pids(parent_pid: int) -> list[int]:
         import psutil
         parent = psutil.Process(parent_pid)
         return [c.pid for c in parent.children(recursive=True)]
-    except (ImportError, Exception):
+    except Exception:
         pass
 
     # Fallback: pgrep -P, then recurse one level
@@ -280,6 +290,21 @@ def _kill_pids(pids: list[int]):
             pass
 
 
+def _write_temp_json(settings: dict, prefix: str) -> str:
+    """Write *settings* to a temporary ``.json`` file and return its path."""
+    fd, path = tempfile.mkstemp(suffix=".json", prefix=prefix)
+    try:
+        with open(fd, "w", encoding="utf-8") as f:
+            _json.dump(settings, f)
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    return path
+
+
 def _write_export_settings(output_dir: str, *, binary: bool = False,
                            pack: bool = False) -> str:
     """Create a temporary export-settings JSON file and return its path.
@@ -307,15 +332,7 @@ def _write_export_settings(output_dir: str, *, binary: bool = False,
         settings["packSource"] = "attachments"
         settings["packTarget"] = "perskeleton"
 
-    fd, path = tempfile.mkstemp(suffix=".json", prefix="ssk_export_")
-    try:
-        with open(fd, "w", encoding="utf-8") as f:
-            _json.dump(settings, f)
-    except Exception:
-        import os
-        os.close(fd)
-        raise
-    return path
+    return _write_temp_json(settings, "ssk_export_")
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +355,7 @@ def export_spine_project(
     """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
+    start_time = time.time()
 
     settings_path = _write_export_settings(output_dir, binary=binary, pack=pack)
     try:
@@ -366,19 +384,43 @@ def export_spine_project(
         except OSError:
             pass
 
-    # Find exported files
-    json_path = ""
-    skel_path = ""
-    atlas_path = ""
+    # Find files produced by THIS run (stale files from earlier exports and
+    # other skeletons must not be picked up arbitrarily).
+    jsons: list[str] = []
+    skels: list[str] = []
+    atlases: list[str] = []
     if out.is_dir():
-        for f in out.iterdir():
+        for f in sorted(out.iterdir(), key=lambda p: p.name):
+            if not f.is_file():
+                continue
+            try:
+                fresh = f.stat().st_mtime >= start_time - 1.0
+            except OSError:
+                continue
+            if not fresh:
+                continue
             if f.suffix == ".json":
-                json_path = str(f)
+                jsons.append(str(f))
             elif f.suffix == ".skel":
-                skel_path = str(f)
+                skels.append(str(f))
             elif f.name.endswith(".atlas") or f.name.endswith(".atlas.txt"):
-                atlas_path = str(f)
+                atlases.append(str(f))
 
+    spine_stem = Path(spine_file).stem
+
+    def _pick(paths: list[str]) -> str:
+        if not paths:
+            return ""
+        for pth in paths:
+            name = Path(pth).name
+            stem = name[:-len(".atlas.txt")] if name.endswith(".atlas.txt") else Path(pth).stem
+            if stem == spine_stem:
+                return pth
+        return paths[0]
+
+    json_path = _pick(jsons)
+    skel_path = _pick(skels)
+    atlas_path = _pick(atlases)
     data_path = skel_path if binary else json_path
 
     if not data_path:
@@ -397,7 +439,53 @@ def export_spine_project(
     return SpineCliResult(
         success=True, stdout=stdout, stderr=stderr,
         output_json=data_path, output_atlas=atlas_path,
+        output_jsons=jsons, output_skels=skels, output_atlases=atlases,
     )
+
+
+def _sanitise_filename(name: str) -> str:
+    """Replace characters that are invalid in file names with ``_``."""
+    out = re.sub(r'[/\\:*?"<>|]', "_", name).strip()
+    return out or "_"
+
+
+def _match_animation_frames(tmp: Path, animations: list[str]) -> dict[str, Path]:
+    """Match PNGs below *tmp* to animation names (see ``export_first_frames``)."""
+    pngs = sorted(tmp.rglob("*.png"))
+    rels = [(p, p.relative_to(tmp)) for p in pngs]
+    results: dict[str, Path] = {}
+
+    def _first(pred) -> Optional[Path]:
+        for p, rel in rels:
+            if pred(p, rel):
+                return p
+        return None
+
+    for anim in animations:
+        if anim in results:
+            continue
+        anim_posix = anim.replace("\\", "/")
+        hit = None
+        # 1. exact folder: the immediate folder or the nested path (fx/win)
+        hit = _first(lambda p, rel: rel.parent.as_posix() == anim_posix)
+        if hit is None:
+            hit = _first(lambda p, rel: p.parent.name == anim)
+        # 2. exact stem (also with trailing frame digits stripped)
+        if hit is None:
+            hit = _first(lambda p, rel: p.stem == anim
+                         or rel.with_suffix("").as_posix() == anim_posix)
+        if hit is None:
+            hit = _first(lambda p, rel: (p.stem.rstrip("0123456789") or p.stem) == anim)
+        # 3. loose substring match only when it is unambiguous
+        if hit is None:
+            low = anim.lower()
+            cands = [p for p, rel in rels
+                     if low in p.stem.lower() or low in p.parent.name.lower()]
+            if len(cands) == 1:
+                hit = cands[0]
+        if hit is not None:
+            results[anim] = hit
+    return results
 
 
 def export_first_frames(
@@ -414,26 +502,24 @@ def export_first_frames(
     *export_settings* is a dict with Spine CLI ``export-png`` fields.
     The ``output`` and ``open`` keys are overridden automatically.
 
+    Spine exports into a fresh temporary directory; only the first frame of
+    each selected animation is copied to *output_dir* as
+    ``<sanitised animation name>.png``.  Nothing already in *output_dir* is
+    ever touched or deleted.
+
     Returns a dict mapping animation name -> output PNG path.
     """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    settings = dict(export_settings)
-    settings["output"] = str(out.resolve())
-    settings["open"] = False
-
-    # Write temp settings with overridden output
-    fd, tmp_path = tempfile.mkstemp(suffix=".json", prefix="ssk_img_")
+    tmp_out = Path(tempfile.mkdtemp(prefix="ssk_frames_"))
+    tmp_path = ""
     try:
-        with open(fd, "w", encoding="utf-8") as f:
-            _json.dump(settings, f)
-    except Exception:
-        import os
-        os.close(fd)
-        raise
+        settings = dict(export_settings)
+        settings["output"] = str(tmp_out.resolve())
+        settings["open"] = False
+        tmp_path = _write_temp_json(settings, "ssk_img_")
 
-    try:
         cmd = [exe]
         version = read_spine_file_version(spine_file)
         if version:
@@ -454,55 +540,32 @@ def export_first_frames(
             if on_output:
                 on_output(f"Export failed (exit {rc}): {stderr}")
             return {}
+
+        matched = _match_animation_frames(tmp_out, list(animations))
+
+        results: dict[str, str] = {}
+        used: set[str] = set()
+        for anim in animations:
+            src = matched.get(anim)
+            if src is None:
+                continue
+            base = _sanitise_filename(anim)
+            name = base
+            n = 2
+            while name.lower() in used:
+                name = f"{base}_{n}"
+                n += 1
+            used.add(name.lower())
+            dst = out / f"{name}.png"
+            shutil.copyfile(src, dst)
+            results[anim] = str(dst)
     finally:
-        try:
-            Path(tmp_path).unlink(missing_ok=True)
-        except OSError:
-            pass
-
-    # Scan output dir for PNGs and match to animation names.
-    # Spine typically outputs: <anim_name>/<frame>.png  or  <anim_name>.png
-    # For fps=1, first frame is usually 0000.png or the only file.
-    results: dict[str, str] = {}
-    anim_set = set(animations)
-
-    for png in sorted(out.rglob("*.png")):
-        # Try matching by parent folder name (Spine puts each anim in subdir)
-        folder_name = png.parent.name
-        if folder_name in anim_set and folder_name not in results:
-            results[folder_name] = str(png)
-            continue
-        # Try matching by file stem
-        stem = png.stem
-        # Strip trailing frame numbers (e.g. "walk0000" -> "walk")
-        clean = stem.rstrip("0123456789") or stem
-        if clean in anim_set and clean not in results:
-            results[clean] = str(png)
-
-    # For animations not yet matched, try looser matching
-    for anim in animations:
-        if anim in results:
-            continue
-        for png in sorted(out.rglob("*.png")):
-            if anim.lower() in png.stem.lower() or anim.lower() in png.parent.name.lower():
-                results[anim] = str(png)
-                break
-
-    # Delete everything that wasn't matched to a selected animation
-    matched_paths = set(Path(p) for p in results.values())
-    for png in list(out.rglob("*.png")):
-        if png not in matched_paths:
+        if tmp_path:
             try:
-                png.unlink()
+                Path(tmp_path).unlink(missing_ok=True)
             except OSError:
                 pass
-    # Clean up empty subdirectories
-    for d in sorted(out.rglob("*"), reverse=True):
-        if d.is_dir():
-            try:
-                d.rmdir()  # only removes if empty
-            except OSError:
-                pass
+        shutil.rmtree(tmp_out, ignore_errors=True)
 
     if on_output:
         on_output(f"Found {len(results)}/{len(animations)} animation frame(s)")
@@ -567,14 +630,7 @@ def export_animation_pngs(
         "compression": 1,
     }
 
-    fd, tmp_path = tempfile.mkstemp(suffix=".json", prefix="ssk_dopt_")
-    try:
-        with open(fd, "w", encoding="utf-8") as f:
-            _json.dump(settings, f)
-    except Exception:
-        import os
-        os.close(fd)
-        raise
+    tmp_path = _write_temp_json(settings, "ssk_dopt_")
 
     try:
         cmd = [exe]

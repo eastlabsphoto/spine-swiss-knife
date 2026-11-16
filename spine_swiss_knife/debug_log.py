@@ -4,6 +4,8 @@ Captures unhandled exceptions and stderr, displays them in a QTextEdit so
 users without source code can see (and copy) what went wrong.
 """
 
+from __future__ import annotations
+
 import sys
 import traceback
 
@@ -20,6 +22,20 @@ class _ErrorSignal(QObject):
 
 
 _signal = _ErrorSignal()
+
+
+def log_error(text: str) -> None:
+    """Send *text* to the debug console (thread-safe, never raises)."""
+    try:
+        _signal.error.emit(str(text))
+    except Exception:
+        pass
+
+
+def log_exception(context: str = "") -> None:
+    """Log the exception currently being handled, with its full traceback."""
+    tb_text = traceback.format_exc()
+    log_error((context + "\n" if context else "") + tb_text)
 
 
 class DebugConsole(QWidget):
@@ -95,6 +111,15 @@ class DebugConsole(QWidget):
         # Auto-scroll to bottom
         sb = self._log.verticalScrollBar()
         sb.setValue(sb.maximum())
+
+    def append_text(self, text: str):
+        """Public: add *text* to the console (same as an error line)."""
+        self._append_error(text)
+
+    def expand(self):
+        """Public: make the log area visible."""
+        if not self._expanded:
+            self._toggle()
 
     def _copy(self):
         text = self._log.toPlainText()

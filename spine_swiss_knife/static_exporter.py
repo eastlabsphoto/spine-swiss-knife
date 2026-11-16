@@ -7,6 +7,8 @@ Uses hardcoded export-png settings (discovered from Spine CLI).  The user
 can tweak parameters via an Export Settings dialog.
 """
 
+from __future__ import annotations
+
 import json as _json
 import os
 from pathlib import Path
@@ -687,10 +689,12 @@ class StaticExporterTab:
         self._append(tr("static.log.normalizing"))
         QApplication.processEvents()
 
+        failed_steps: list[str] = []
         try:
             _normalize_canvas(exported, shape, padding, center,
                               fixed_size=fixed_size)
         except Exception as e:
+            failed_steps.append("normalize")
             self._append(tr("static.log.error", error=str(e)), "#f9e2af")
 
         # Step 3: Blur variants
@@ -706,10 +710,18 @@ class StaticExporterTab:
                     blur_canvas_size=blur_canvas_size)
                 self._append(f"Created {len(blur_paths)} blur variant(s)")
             except Exception as e:
+                failed_steps.append("blur")
                 self._append(tr("static.log.error", error=str(e)), "#f9e2af")
 
         # Done
         self._append("")
+        if failed_steps:
+            msg = tr("static.stats.done_with_errors",
+                     exported=len(exported), total=len(checked),
+                     dir=output_dir, steps=", ".join(failed_steps))
+            self._append(msg, "#f9e2af", bold=True)
+            self._stats.setText(msg)
+            return
         self._append(
             tr("static.log.done", count=len(exported), dir=output_dir),
             "#a6e3a1", bold=True,

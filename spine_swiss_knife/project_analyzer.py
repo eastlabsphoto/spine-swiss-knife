@@ -1,5 +1,7 @@
 """Project Analyzer tab — project health check and overview report."""
 
+from __future__ import annotations
+
 import os
 import subprocess
 
@@ -11,7 +13,11 @@ from PySide6.QtGui import QFont, QColor, QTextCharFormat, QTextCursor
 from PySide6.QtCore import Qt
 
 from .i18n import tr, language_changed
-from .spine_json import load_spine_json, normalize_skins
+from .spine_json import (
+    load_spine_json, normalize_skins, attachment_image_key,
+    iter_deform_timelines, get_draw_order_timeline,
+)
+from .spine_refs import find_dead_bones
 from .atlas_parser import collect_images
 
 try:
@@ -74,6 +80,23 @@ def _count_keyframes_in_timeline(timeline_dict: dict) -> int:
     return total
 
 
+def _max_time_in(node) -> float:
+    """Largest keyframe ``time`` found anywhere inside a timeline structure."""
+    best = 0.0
+    if isinstance(node, list):
+        for item in node:
+            if isinstance(item, dict):
+                t = item.get("time", 0)
+                if isinstance(t, (int, float)) and t > best:
+                    best = t
+                best = max(best, _max_time_in(item))
+    elif isinstance(node, dict):
+        for value in node.values():
+            if isinstance(value, (list, dict)):
+                best = max(best, _max_time_in(value))
+    return best
+
+
 def _analyze_animations(spine_data: dict) -> dict:
     animations = spine_data.get("animations", {})
     anim_details = []
@@ -97,36 +120,20 @@ def _analyze_animations(spine_data: dict) -> dict:
                         slot_kf += len(frames)
 
         kf_count = bone_kf + slot_kf
-        for extra_key in ("deform", "ik", "transform", "path"):
+        for extra_key in ("ik", "transform", "path", "physics"):
             extra = anim_data.get(extra_key, {})
             if isinstance(extra, dict):
                 kf_count += _count_keyframes_in_timeline(extra)
+        # deform keys in every format: ffd, deform and 4.1+ attachments.<..>.deform
+        for _skin, _slot, _att, keys in iter_deform_timelines(anim_data):
+            kf_count += len(keys)
 
         events = anim_data.get("events", [])
         if isinstance(events, list):
             kf_count += len(events)
-        draw_order = anim_data.get("drawOrder", [])
-        if isinstance(draw_order, list):
-            kf_count += len(draw_order)
+        kf_count += len(get_draw_order_timeline(anim_data))
 
-        duration = 0.0
-        for section_data in anim_data.values():
-            if isinstance(section_data, list):
-                for frame in section_data:
-                    if isinstance(frame, dict):
-                        duration = max(duration, frame.get("time", 0))
-            elif isinstance(section_data, dict):
-                for sub in section_data.values():
-                    if isinstance(sub, list):
-                        for frame in sub:
-                            if isinstance(frame, dict):
-                                duration = max(duration, frame.get("time", 0))
-                    elif isinstance(sub, dict):
-                        for sub2 in sub.values():
-                            if isinstance(sub2, list):
-                                for frame in sub2:
-                                    if isinstance(frame, dict):
-                                        duration = max(duration, frame.get("time", 0))
+        duration = _max_time_in(anim_data)
 
         anim_details.append({
             "name": anim_name, "keyframes": kf_count,
@@ -153,8 +160,8 @@ def _analyze_attachments(skins: dict) -> dict:
                 if att_type is None:
                     att_type = "region"
                 type_counts[att_type] = type_counts.get(att_type, 0) + 1
-                if att_type in ("region", "mesh"):
-                    referenced_images.add(att_data.get("path", att_name))
+                if att_type in ("region", "mesh", "linkedmesh"):
+                    referenced_images.add(attachment_image_key(att_name, att_data))
                 if att_type in ("mesh", "clipping"):
                     vc = att_data.get("vertexCount", 0)
                     if att_type == "mesh":
@@ -175,51 +182,9 @@ def _analyze_attachments(skins: dict) -> dict:
 
 
 def _analyze_dead_bones(spine_data: dict) -> list[str]:
-    bones = spine_data.get("bones", [])
-    bone_names = {b.get("name", "") for b in bones if isinstance(b, dict)}
-    slots = spine_data.get("slots", [])
-    bones_with_slots = set()
-    for slot in slots:
-        if isinstance(slot, dict):
-            bone = slot.get("bone", "")
-            if bone:
-                bones_with_slots.add(bone)
-
-    bones_with_anims = set()
-    animations = spine_data.get("animations", {})
-    for anim_name, anim_data in animations.items():
-        bones_with_anims.update(anim_data.get("bones", {}).keys())
-
-    for constraint_type in ("ik", "transform", "path"):
-        constraints = spine_data.get(constraint_type, [])
-        if isinstance(constraints, list):
-            for c in constraints:
-                if isinstance(c, dict):
-                    cbones = c.get("bones", [])
-                    if isinstance(cbones, list):
-                        bones_with_anims.update(cbones)
-                    for field in ("target", "bone"):
-                        v = c.get(field, "")
-                        if v:
-                            bones_with_anims.add(v)
-
-    used_bones = bones_with_slots | bones_with_anims | {"root"}
-    bone_parents = {}
-    for b in bones:
-        if isinstance(b, dict):
-            name = b.get("name", "")
-            parent = b.get("parent", "")
-            if name:
-                bone_parents[name] = parent
-
-    needed = set()
-    for bone in used_bones:
-        current = bone
-        while current and current not in needed:
-            needed.add(current)
-            current = bone_parents.get(current, "")
-
-    return sorted(bone_names - needed)
+    """Bones that nothing needs (see ``spine_refs.find_dead_bones``)."""
+    dead, _alive = find_dead_bones(spine_data)
+    return list(dead)
 
 
 def _find_masked_meshes(spine_data: dict, skins: dict) -> list[dict]:
@@ -229,7 +194,7 @@ def _find_masked_meshes(spine_data: dict, skins: dict) -> list[dict]:
     for skin_name, skin_data in skins.items():
         for slot_name, atts in skin_data.items():
             for att_name, att_data in atts.items():
-                if att_data.get("type") == "mesh":
+                if att_data.get("type") in ("mesh", "linkedmesh"):
                     mesh_slots.setdefault(slot_name, set()).add(att_name)
     if not mesh_slots:
         return []
@@ -242,7 +207,9 @@ def _find_masked_meshes(spine_data: dict, skins: dict) -> list[dict]:
                     continue
                 end_slot = att_data.get("end", "")
                 clip_idx = slot_order.get(slot_name, -1)
-                end_idx = slot_order.get(end_slot, -1)
+                # No "end": the clip lasts to the end of the draw order.
+                end_idx = (slot_order.get(end_slot, -1) if end_slot
+                           else len(slots) - 1)
                 if clip_idx < 0 or end_idx < 0:
                     continue
                 for s in slots[clip_idx + 1: end_idx + 1]:

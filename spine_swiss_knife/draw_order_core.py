@@ -6,6 +6,7 @@ and search heuristics can be unit-tested in isolation.
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Iterable, Iterator
 
 try:
@@ -16,8 +17,19 @@ except ImportError:  # pragma: no cover - exercised in app fallback mode
     HAS_NUMPY = False
 
 
+from .spine_json import get_draw_order_timeline
+from .spine_refs import encode_draw_order_offsets, rewrite_draw_order_offsets
+
 DEFAULT_TOLERANCE = 6
 DEFAULT_THRESHOLD_PERCENT = 1.0
+
+# Verification memory budget / sampling (see plan_baseline_storage).
+BASELINE_MEMORY_BUDGET = 1024 * 1024 * 1024  # 1 GB
+FPS_STEPS = (60, 30, 20, 15)
+# Local (grid cell) comparison.
+CELL_SIZE = 64
+CELL_MAX_BAD_FRACTION = 0.5
+CELL_MIN_VISIBLE = 16
 
 
 def threshold_percent_to_ratio(percent: float) -> float:
@@ -25,15 +37,180 @@ def threshold_percent_to_ratio(percent: float) -> float:
     return percent / 100.0
 
 
+def _strip_draw_order(data: dict) -> dict:
+    """Copy of *data* without slots and without draw-order timelines."""
+    out = {k: v for k, v in data.items() if k != "slots"}
+    anims = data.get("animations")
+    if isinstance(anims, dict):
+        new_anims = {}
+        for name, anim in anims.items():
+            if isinstance(anim, dict):
+                anim = {k: v for k, v in anim.items()
+                        if k not in ("drawOrder", "draworder")}
+            new_anims[name] = anim
+        out["animations"] = new_anims
+    return out
+
+
+def _slot_signature(slot) -> str:
+    import json
+    return json.dumps(slot, sort_keys=True, default=str)
+
+
+def baseline_is_reorder_of(current: dict, baseline: dict) -> bool:
+    """True iff *current* is a pure slot reorder of *baseline*.
+
+    Both must hold the same slots as a multiset of slot dicts (order ignored)
+    and be equal everywhere else once draw-order timelines are removed from
+    all animations.
+    """
+    if not isinstance(current, dict) or not isinstance(baseline, dict):
+        return False
+    cs = current.get("slots") or []
+    bs = baseline.get("slots") or []
+    if len(cs) != len(bs):
+        return False
+    if sorted(_slot_signature(s) for s in cs) != sorted(_slot_signature(s) for s in bs):
+        return False
+    return _strip_draw_order(current) == _strip_draw_order(baseline)
+
+
 def resolve_baseline_paths(
     json_path: str,
     *,
     backup_exists: bool,
+    backup_is_reorder: bool = True,
 ) -> tuple[str, str, bool]:
-    """Resolve the frozen comparison baseline and backup target paths."""
+    """Resolve the comparison baseline and backup target paths.
+
+    The ``.backup`` file is only a valid baseline when it exists AND the
+    current JSON is a pure slot reorder of it (*backup_is_reorder*, see
+    :func:`baseline_is_reorder_of`); otherwise the current JSON is the baseline.
+    The third value tells whether the backup has to be (re)created.
+    """
     backup_path = json_path + ".backup"
-    baseline_path = backup_path if backup_exists else json_path
-    return baseline_path, backup_path, not backup_exists
+    use_backup = backup_exists and backup_is_reorder
+    baseline_path = backup_path if use_backup else json_path
+    return baseline_path, backup_path, not use_backup
+
+
+def build_reordered_data(spine_data: dict, new_slots: list, deep: bool = False) -> dict:
+    """Copy of *spine_data* with slots in *new_slots* order and every
+    draw-order offsets list re-encoded so absolute draw orders are unchanged.
+
+    The offsets are re-encoded relative to ``spine_data["slots"]``. With
+    ``deep=False`` only the structures that are modified are copied.
+    """
+    old_names = [s.get("name") for s in spine_data.get("slots") or []]
+    new_names = [s.get("name") for s in new_slots]
+    if deep:
+        out = copy.deepcopy(spine_data)
+    else:
+        out = dict(spine_data)
+        anims = spine_data.get("animations")
+        if isinstance(anims, dict):
+            new_anims = {}
+            for name, anim in anims.items():
+                if isinstance(anim, dict) and get_draw_order_timeline(anim):
+                    anim = dict(anim)
+                    for key in ("drawOrder", "draworder"):
+                        if key in anim:
+                            anim[key] = copy.deepcopy(anim[key])
+                new_anims[name] = anim
+            out["animations"] = new_anims
+    out["slots"] = list(new_slots)
+    if old_names != new_names:
+        setup_keys = _setup_order_keys(out)
+        rewrite_draw_order_offsets(out, old_names, new_names)
+        _preserve_setup_order_keys(out, old_names, new_names, setup_keys)
+    return out
+
+
+def _setup_order_keys(data: dict) -> list:
+    """Draw-order key dicts (by identity) that have no offsets."""
+    keys = []
+    for anim in (data.get("animations") or {}).values():
+        if isinstance(anim, dict):
+            keys.extend(k for k in get_draw_order_timeline(anim)
+                        if isinstance(k, dict) and not k.get("offsets"))
+    return keys
+
+
+def _preserve_setup_order_keys(data: dict, old_names: list, new_names: list,
+                               setup_keys: list):
+    """Draw-order keys without offsets (and the time before the first key)
+    mean *setup order*, which just changed. Re-encode them as explicit
+    offsets of the OLD setup order so the absolute order stays the same."""
+    try:
+        old_as_offsets = encode_draw_order_offsets(new_names, old_names)
+    except ValueError:
+        return
+    if not old_as_offsets:
+        return
+    for anim in (data.get("animations") or {}).values():
+        if not isinstance(anim, dict):
+            continue
+        timeline = get_draw_order_timeline(anim)
+        if not timeline:
+            continue
+        for key in timeline:
+            if any(key is k for k in setup_keys):
+                key["offsets"] = copy.deepcopy(old_as_offsets)
+        first = timeline[0]
+        if isinstance(first, dict) and first.get("time", 0) > 0:
+            timeline.insert(0, {"time": 0,
+                                "offsets": copy.deepcopy(old_as_offsets)})
+
+
+def sample_times(duration: float, fps: float) -> list:
+    """Sample times 0, 1/fps, ... below *duration*, always ending at *duration*."""
+    if duration <= 0 or fps <= 0:
+        return [0.0]
+    times = []
+    i = 0
+    while True:
+        t = i / fps
+        if t >= duration - 1e-9:
+            break
+        times.append(t)
+        i += 1
+    times.append(float(duration))
+    return times
+
+
+def plan_baseline_storage(durations, skin_count: int, width: int, height: int,
+                          fps: int = 60, budget: int = BASELINE_MEMORY_BUDGET):
+    """Choose sampling rate and storage for the cached baseline frames.
+
+    *durations* is the duration of every rendered animation (the setup pose
+    is one extra frame). Returns ``(fps, mode, estimated_bytes)`` where mode is
+    ``"memory"`` or ``"disk"`` (spill to a temp directory at the lowest rate).
+    """
+    frame_bytes = max(1, int(width)) * max(1, int(height)) * 4
+    skins = max(1, int(skin_count))
+    candidates = [f for f in FPS_STEPS if f <= fps] or [min(FPS_STEPS)]
+    if fps not in candidates and fps < min(FPS_STEPS):
+        candidates = [fps]
+    elif fps not in candidates:
+        candidates.insert(0, fps)
+    est = 0
+    for cand in candidates:
+        frames = skins * (1 + sum(len(sample_times(d, cand)) for d in durations))
+        est = frames * frame_bytes
+        if est <= budget:
+            return cand, "memory", est
+    return candidates[-1], "disk", est
+
+
+def sanitize_dir_name(name) -> str:
+    """Filesystem-safe directory name for an animation label."""
+    import re
+    if name is None:
+        return "setup_pose"
+    text = str(name)
+    text = re.sub(r'[/\\:*?"<>|\x00-\x1f]', "_", text)
+    text = text.rstrip(". ")
+    return "anim_" + text
 
 
 def count_blend_groups(slots: list[dict]) -> int:
@@ -155,18 +332,53 @@ def compare_rgba_arrays(
 
     bad_mask = pixel_max > tolerance
     if visible > 0:
-        bad = int(np.count_nonzero(bad_mask & visible_mask))
-    else:
-        bad = int(np.count_nonzero(bad_mask))
+        bad_mask = bad_mask & visible_mask
+    bad = int(np.count_nonzero(bad_mask))
 
     pct_bad = bad / denom * 100 if denom > 0 else 0.0
-    match = bad / denom < threshold if denom > 0 else True
+    global_ok = bad / denom < threshold if denom > 0 else True
+    worst_cell = _worst_cell_fraction(bad_mask, visible_mask if visible > 0 else None)
+    local_ok = worst_cell <= CELL_MAX_BAD_FRACTION
+    match = global_ok and local_ok
     return match, {
         "max_diff": max_val,
         "bad_pixels": bad,
         "visible_pixels": visible,
         "pct_bad": pct_bad,
+        "worst_cell_pct": worst_cell * 100,
     }
+
+
+def _worst_cell_fraction(bad_mask, visible_mask) -> float:
+    """Largest fraction of differing pixels among visible pixels of any
+    CELL_SIZE x CELL_SIZE cell (two grid origins, so a small element cannot
+    hide on a cell border). Cells with fewer than CELL_MIN_VISIBLE visible
+    pixels are ignored."""
+    if bad_mask.size == 0 or not bad_mask.any():
+        return 0.0
+    if visible_mask is None:
+        visible_mask = np.ones_like(bad_mask)
+    h, w = bad_mask.shape
+    worst = 0.0
+    c = CELL_SIZE
+    for off in (0, c // 2):
+        bm = bad_mask[off:, off:]
+        vm = visible_mask[off:, off:]
+        hh, ww = bm.shape
+        if hh == 0 or ww == 0:
+            continue
+        ph, pw = (-hh) % c, (-ww) % c
+        if ph or pw:
+            bm = np.pad(bm, ((0, ph), (0, pw)))
+            vm = np.pad(vm, ((0, ph), (0, pw)))
+        gh, gw = bm.shape[0] // c, bm.shape[1] // c
+        bad_c = bm.reshape(gh, c, gw, c).sum(axis=(1, 3))
+        vis_c = vm.reshape(gh, c, gw, c).sum(axis=(1, 3))
+        ok = vis_c >= CELL_MIN_VISIBLE
+        if ok.any():
+            frac = bad_c[ok] / vis_c[ok]
+            worst = max(worst, float(frac.max()))
+    return worst
 
 
 def plan_composition_batches(draw_list: list[dict]) -> Iterator[tuple[str, list[dict]]]:

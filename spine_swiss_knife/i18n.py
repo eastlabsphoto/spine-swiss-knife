@@ -1,5 +1,7 @@
 """Internationalization — flat-key JSON locale files with runtime switching."""
 
+from __future__ import annotations
+
 import json
 import os
 from pathlib import Path
@@ -18,19 +20,27 @@ class _I18n(QObject):
         self._strings: dict[str, str] = {}
         self._load("en")
 
-    def _load(self, lang: str):
+    def _load(self, lang: str) -> bool:
+        """Load a locale file; keep the current strings if it is missing/invalid."""
         path = _LOCALES_DIR / f"{lang}.json"
         if not path.is_file():
-            return
-        with open(path, "r", encoding="utf-8") as f:
-            self._strings = json.load(f)
+            return False
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                strings = json.load(f)
+        except (OSError, ValueError):
+            return False
+        if not isinstance(strings, dict):
+            return False
+        self._strings = strings
         self._lang = lang
+        return True
 
     def set_language(self, lang: str):
         if lang == self._lang:
             return
-        self._load(lang)
-        self.language_changed.emit()
+        if self._load(lang):
+            self.language_changed.emit()
 
     def tr(self, key: str, /, **kwargs) -> str:
         # `key` is positional-only so a format placeholder named {key} (passed as
@@ -39,7 +49,7 @@ class _I18n(QObject):
         if kwargs:
             try:
                 text = text.format(**kwargs)
-            except (KeyError, IndexError):
+            except (KeyError, IndexError, ValueError, AttributeError):
                 pass
         return text
 

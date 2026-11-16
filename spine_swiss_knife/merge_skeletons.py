@@ -1,9 +1,10 @@
 """Merge Skeletons — combine multiple Spine JSON files into one project."""
 
-import hashlib
+from __future__ import annotations
+
 import os
 import shutil
-from copy import deepcopy
+import tempfile
 from pathlib import Path
 
 from PySide6.QtWidgets import (
@@ -16,9 +17,12 @@ from PySide6.QtGui import QTextCharFormat, QColor, QFont, QTextCursor
 from PySide6.QtCore import Qt
 
 from .i18n import tr, language_changed
-from .spine_json import (
-    load_spine_json, save_spine_json, normalize_skins, denormalize_skins,
-    is_skins_list, attachment_image_key,
+from .spine_json import load_spine_json, save_spine_json
+from .merge_core import (  # noqa: F401 - re-exported for existing importers
+    merge_image_dirs as _core_merge_image_dirs,
+    merge_spine_data as _core_merge_spine_data,
+    _file_hash, _rename_slots_in_animation, _rename_events_in_animation,
+    _apply_image_renames_to_skins, _unique_name,
 )
 from .spine_cli import (
     read_spine_file_version, export_spine_project,
@@ -26,21 +30,13 @@ from .spine_cli import (
 from .settings import settings
 
 
-# ── Image types that reference image files ──
-_IMAGE_ATT_TYPES = {None, "region", "mesh", "linkedmesh"}
-
-
 # ==========================================================================
-# Image merge
+# Core wrappers (pure logic lives in merge_core; warnings are translated here)
 # ==========================================================================
 
-def _file_hash(path: str) -> str:
-    """SHA-256 hash of a file."""
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest()
+def _translate_warning(w) -> str:
+    code, params = w
+    return tr("merge.warn." + code, **params)
 
 
 def merge_image_dirs(
@@ -48,175 +44,9 @@ def merge_image_dirs(
     source_labels: list[str],
     output_dir: str,
 ) -> tuple[list[dict[str, str]], list[str]]:
-    """Merge image directories into *output_dir*.
-
-    Returns:
-      image_rename_maps: one dict per source, mapping old_image_key -> new_image_key
-                         (only entries that changed are included)
-      warnings: list of warning strings
-    """
-    image_exts = {".png", ".jpg", ".jpeg", ".bmp", ".tga", ".webp"}
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
-
-    warnings: list[str] = []
-    image_rename_maps: list[dict[str, str]] = [{} for _ in source_dirs]
-
-    # Collect all images: list of (source_idx, rel_path, abs_path, image_key)
-    all_images: list[tuple[int, str, str, str]] = []
-    for idx, sdir in enumerate(source_dirs):
-        if not sdir or not Path(sdir).is_dir():
-            continue
-        root = Path(sdir)
-        for dirpath, dirnames, filenames in os.walk(sdir):
-            dirnames[:] = [d for d in dirnames if not d.startswith("_")]
-            for fname in filenames:
-                fp = Path(dirpath) / fname
-                if fp.suffix.lower() in image_exts:
-                    rel = fp.relative_to(root)
-                    key = str(rel.with_suffix("")).replace("\\", "/")
-                    all_images.append((idx, str(rel), str(fp), key))
-
-    # Group by image_key
-    by_key: dict[str, list[tuple[int, str, str]]] = {}
-    for idx, rel, abspath, key in all_images:
-        by_key.setdefault(key, []).append((idx, rel, abspath))
-
-    # Track output names for uniqueness
-    used_output_keys: set[str] = set()
-
-    for key, entries in sorted(by_key.items()):
-        if len(entries) == 1:
-            # No conflict — copy to output
-            idx, rel, abspath = entries[0]
-            dst = out / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(abspath, str(dst))
-            used_output_keys.add(key)
-            continue
-
-        # Multiple sources have the same key — compare content
-        hashes = [(idx, rel, abspath, _file_hash(abspath)) for idx, rel, abspath in entries]
-        unique_hashes: dict[str, list[tuple[int, str, str]]] = {}
-        for idx, rel, abspath, h in hashes:
-            unique_hashes.setdefault(h, []).append((idx, rel, abspath))
-
-        if len(unique_hashes) == 1:
-            # All identical — copy once
-            _, rel, abspath = entries[0]
-            dst = out / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(abspath, str(dst))
-            used_output_keys.add(key)
-            continue
-
-        # Different content — first unique hash keeps original name, rest get suffix
-        first = True
-        for h, group in unique_hashes.items():
-            if first:
-                # First group keeps original name
-                _, rel, abspath = group[0]
-                dst = out / rel
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(abspath, str(dst))
-                used_output_keys.add(key)
-                first = False
-                continue
-
-            # Subsequent groups get suffix
-            for idx, rel, abspath in group:
-                rel_p = Path(rel)
-                label = source_labels[idx]
-                new_stem = f"{rel_p.stem}_{label}"
-                new_rel = str(rel_p.with_stem(new_stem)).replace("\\", "/")
-                new_key = str(Path(new_rel).with_suffix("")).replace("\\", "/")
-
-                # Ensure uniqueness
-                candidate = new_key
-                counter = 2
-                while candidate in used_output_keys:
-                    candidate = f"{new_key}_{counter}"
-                    new_rel = str(Path(rel).with_stem(f"{new_stem}_{counter}")).replace("\\", "/")
-                    counter += 1
-                new_key = candidate
-                new_rel_final = new_rel if counter == 2 else new_rel
-
-                dst = out / new_rel
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(abspath, str(dst))
-                used_output_keys.add(new_key)
-                image_rename_maps[idx][key] = new_key
-                warnings.append(
-                    tr("merge.warn.image_renamed", old=key, new=new_key,
-                       source=source_labels[idx])
-                )
-
-    return image_rename_maps, warnings
-
-
-# ==========================================================================
-# Rename helpers for animation data
-# ==========================================================================
-
-def _rename_slots_in_animation(anim_data: dict, renames: dict[str, str]):
-    """Rename slot references inside a single animation."""
-    if "slots" in anim_data:
-        anim_data["slots"] = {
-            renames.get(k, k): v for k, v in anim_data["slots"].items()
-        }
-    if "drawOrder" in anim_data:
-        for entry in anim_data["drawOrder"]:
-            for offset in entry.get("offsets", []):
-                old = offset.get("slot")
-                if old in renames:
-                    offset["slot"] = renames[old]
-    if "deform" in anim_data:
-        new_deform = {}
-        for skin_name, slots in anim_data["deform"].items():
-            new_deform[skin_name] = {
-                renames.get(k, k): v for k, v in slots.items()
-            }
-        anim_data["deform"] = new_deform
-
-
-def _rename_events_in_animation(anim_data: dict, renames: dict[str, str]):
-    """Rename event references inside a single animation."""
-    if "events" in anim_data:
-        for ev in anim_data["events"]:
-            old = ev.get("name")
-            if old in renames:
-                ev["name"] = renames[old]
-
-
-def _apply_image_renames_to_skins(skins: dict, image_renames: dict[str, str]):
-    """Update image path references in skin attachment data."""
-    for skin_name, skin_data in skins.items():
-        for slot_name, attachments in skin_data.items():
-            for att_name, att_data in attachments.items():
-                att_type = att_data.get("type")
-                if att_type not in _IMAGE_ATT_TYPES:
-                    continue
-                img_key = attachment_image_key(att_name, att_data)
-                if img_key in image_renames:
-                    new_key = image_renames[img_key]
-                    if new_key == att_name:
-                        att_data.pop("path", None)
-                    else:
-                        att_data["path"] = new_key
-
-
-# ==========================================================================
-# Core merge
-# ==========================================================================
-
-def _unique_name(base: str, existing: set[str]) -> str:
-    """Return *base* if not in *existing*, otherwise append _2, _3, etc."""
-    if base not in existing:
-        return base
-    counter = 2
-    while f"{base}_{counter}" in existing:
-        counter += 1
-    return f"{base}_{counter}"
+    """Merge image directories into *output_dir* (translated warnings)."""
+    maps, warnings = _core_merge_image_dirs(source_dirs, source_labels, output_dir)
+    return maps, [_translate_warning(w) for w in warnings]
 
 
 def merge_spine_data(
@@ -225,197 +55,10 @@ def merge_spine_data(
     output_name: str,
     image_rename_maps: list[dict[str, str]] | None = None,
 ) -> tuple[dict, list[str]]:
-    """Merge multiple Spine JSON dicts into one.
-
-    Returns (merged_data, warnings).
-    """
-    if not sources:
-        return {}, []
-
-    warnings: list[str] = []
-    base_version = sources[0].get("skeleton", {}).get("spine", "")
-
-    # --- Skeleton metadata ---
-    merged: dict = {
-        "skeleton": {
-            "spine": base_version,
-            "images": "./images/",
-        },
-    }
-
-    # --- Bones ---
-    bone_set: set[str] = set()
-    bone_parents: dict[str, str] = {}  # name -> parent
-    merged_bones: list[dict] = []
-
-    # --- Slots ---
-    slot_set: set[str] = set()
-    merged_slots: list[dict] = []
-
-    # --- Skins (normalized dict format) ---
-    merged_skins: dict[str, dict] = {}
-
-    # --- Events ---
-    event_set: set[str] = set()
-    merged_events: dict = {}
-
-    # --- Animations ---
-    anim_set: set[str] = set()
-    merged_anims: dict = {}
-
-    # --- Constraints ---
-    ik_set: set[str] = set()
-    merged_ik: list[dict] = []
-    transform_set: set[str] = set()
-    merged_transform: list[dict] = []
-    path_set: set[str] = set()
-    merged_path: list[dict] = []
-
-    # Track what was in the first skeleton for the list format check
-    first_was_skins_list = is_skins_list(sources[0])
-
-    for src_idx, (src, label) in enumerate(zip(sources, source_labels)):
-        slot_renames: dict[str, str] = {}
-        event_renames: dict[str, str] = {}
-        img_renames = (image_rename_maps[src_idx]
-                       if image_rename_maps else {})
-
-        # ── Bones ──
-        for bone in src.get("bones", []):
-            name = bone["name"]
-            parent = bone.get("parent", "")
-            if name in bone_set:
-                # Check parent consistency
-                if parent != bone_parents.get(name, ""):
-                    warnings.append(
-                        tr("merge.warn.bone_parent_mismatch",
-                           bone=name, source=label,
-                           expected=bone_parents.get(name, "(root)"),
-                           got=parent or "(root)"))
-                continue
-            bone_set.add(name)
-            bone_parents[name] = parent
-            merged_bones.append(deepcopy(bone))
-
-        # ── Slots ──
-        for slot in src.get("slots", []):
-            name = slot["name"]
-            new_slot = deepcopy(slot)
-            if name in slot_set:
-                new_name = _unique_name(f"{name}_{label}", slot_set)
-                slot_renames[name] = new_name
-                new_slot["name"] = new_name
-                warnings.append(
-                    tr("merge.warn.slot_renamed",
-                       old=name, new=new_name, source=label))
-            slot_set.add(new_slot["name"])
-            merged_slots.append(new_slot)
-
-        # ── Skins ──
-        src_skins = normalize_skins(src.get("skins", {}))
-
-        # Apply image renames to source skins
-        if img_renames:
-            _apply_image_renames_to_skins(src_skins, img_renames)
-
-        for skin_name, skin_data in src_skins.items():
-            if skin_name not in merged_skins:
-                merged_skins[skin_name] = {}
-            dest_skin = merged_skins[skin_name]
-
-            for old_slot, attachments in skin_data.items():
-                slot = slot_renames.get(old_slot, old_slot)
-                if slot not in dest_skin:
-                    dest_skin[slot] = {}
-                dest_skin[slot].update(deepcopy(attachments))
-
-        # ── Events ──
-        for event_name, event_data in src.get("events", {}).items():
-            if event_name in event_set:
-                new_name = _unique_name(f"{event_name}_{label}", event_set)
-                event_renames[event_name] = new_name
-                warnings.append(
-                    tr("merge.warn.event_renamed",
-                       old=event_name, new=new_name, source=label))
-                event_name = new_name
-            event_set.add(event_name)
-            merged_events[event_name] = deepcopy(event_data)
-
-        # ── Animations ──
-        for anim_name, anim_data in src.get("animations", {}).items():
-            new_data = deepcopy(anim_data)
-
-            if slot_renames:
-                _rename_slots_in_animation(new_data, slot_renames)
-            if event_renames:
-                _rename_events_in_animation(new_data, event_renames)
-
-            final_name = anim_name
-            if anim_name in anim_set:
-                final_name = _unique_name(f"{anim_name}_{label}", anim_set)
-                warnings.append(
-                    tr("merge.warn.anim_renamed",
-                       old=anim_name, new=final_name, source=label))
-            anim_set.add(final_name)
-            merged_anims[final_name] = new_data
-
-        # ── IK constraints ──
-        for c in src.get("ik", []):
-            new_c = deepcopy(c)
-            name = c["name"]
-            if name in ik_set:
-                new_name = _unique_name(f"{name}_{label}", ik_set)
-                new_c["name"] = new_name
-                name = new_name
-            ik_set.add(name)
-            merged_ik.append(new_c)
-
-        # ── Transform constraints ──
-        for c in src.get("transform", []):
-            new_c = deepcopy(c)
-            name = c["name"]
-            if name in transform_set:
-                new_name = _unique_name(f"{name}_{label}", transform_set)
-                new_c["name"] = new_name
-                name = new_name
-            transform_set.add(name)
-            merged_transform.append(new_c)
-
-        # ── Path constraints ──
-        for c in src.get("path", []):
-            new_c = deepcopy(c)
-            name = c["name"]
-            # Rename target slot if needed
-            if new_c.get("target") in slot_renames:
-                new_c["target"] = slot_renames[new_c["target"]]
-            if name in path_set:
-                new_name = _unique_name(f"{name}_{label}", path_set)
-                new_c["name"] = new_name
-                name = new_name
-            path_set.add(name)
-            merged_path.append(new_c)
-
-    # --- Assemble output ---
-    merged["bones"] = merged_bones
-    merged["slots"] = merged_slots
-
-    if first_was_skins_list:
-        merged["skins"] = denormalize_skins(merged_skins)
-    else:
-        merged["skins"] = merged_skins
-
-    if merged_events:
-        merged["events"] = merged_events
-    if merged_ik:
-        merged["ik"] = merged_ik
-    if merged_transform:
-        merged["transform"] = merged_transform
-    if merged_path:
-        merged["path"] = merged_path
-
-    merged["animations"] = merged_anims
-
-    return merged, warnings
+    """Merge multiple Spine JSON dicts into one (translated warnings)."""
+    merged, warnings = _core_merge_spine_data(
+        sources, source_labels, output_name, image_rename_maps)
+    return merged, [_translate_warning(w) for w in warnings]
 
 
 # ==========================================================================
@@ -675,7 +318,9 @@ class MergeSkeletonsTab:
                 self._append(tr("merge.log.exporting", name=Path(f["path"]).name))
                 QApplication.processEvents()
 
-                temp_dir = str(Path(output_dir) / f"_ssk_merge_temp_{label}")
+                temp_dir = tempfile.mkdtemp(
+                    prefix="ssk_merge_%s_" % "".join(
+                        ch if ch.isalnum() or ch in "-_" else "_" for ch in label))
                 temp_dirs.append(temp_dir)
 
                 result = export_spine_project(

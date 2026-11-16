@@ -1,15 +1,21 @@
 """Welcome / mode-selection page shown at application startup."""
 
+from __future__ import annotations
+
 from pathlib import Path
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QGroupBox, QFileDialog, QSizePolicy, QMessageBox,
-    QFrame, QProgressDialog, QApplication,
+    QFrame, QApplication, QScrollArea,
 )
 from PySide6.QtCore import Qt, Signal
 
 from .i18n import tr, language_changed
+from .launcher import (
+    claude_code_command, claude_desktop_config_path,
+    claude_desktop_config_snippet, install_claude_desktop_config,
+)
 from .settings import settings
 from .spine_cli import detect_spine_executable
 
@@ -36,12 +42,23 @@ class WelcomePage(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
 
+        # Scrollable body so nothing is cut off in a small window
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet("QScrollArea { border: none; }")
+        body = QWidget()
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(0, 16, 0, 16)
+        scroll.setWidget(body)
+        outer.addWidget(scroll)
+
         # Center everything vertically
-        outer.addStretch(2)
+        body_layout.addStretch(2)
 
         # Container with fixed max width
         container = QWidget()
-        container.setMaximumWidth(520)
+        container.setMaximumWidth(580)
         cl = QVBoxLayout(container)
         cl.setSpacing(16)
 
@@ -109,6 +126,50 @@ class WelcomePage(QWidget):
 
         cl.addWidget(self._path_group)
 
+        # Claude / MCP quick start (how to connect an AI assistant)
+        self._mcp_group = QGroupBox(tr("welcome.mcp.group"))
+        mg_layout = QVBoxLayout(self._mcp_group)
+        mg_layout.setSpacing(8)
+
+        self._mcp_intro = QLabel(tr("welcome.mcp.intro"))
+        self._mcp_intro.setWordWrap(True)
+        mg_layout.addWidget(self._mcp_intro)
+
+        mcp_btn_row = QHBoxLayout()
+        self._mcp_connect_btn = QPushButton(tr("welcome.mcp.connect_btn"))
+        self._mcp_connect_btn.setProperty("role", "primary")
+        self._mcp_connect_btn.setCursor(Qt.PointingHandCursor)
+        self._mcp_connect_btn.clicked.connect(self._connect_claude_desktop)
+        mcp_btn_row.addWidget(self._mcp_connect_btn)
+        self._mcp_copy_cfg_btn = QPushButton(tr("welcome.mcp.copy_config_btn"))
+        self._mcp_copy_cfg_btn.clicked.connect(self._copy_mcp_config)
+        mcp_btn_row.addWidget(self._mcp_copy_cfg_btn)
+        self._mcp_copy_cmd_btn = QPushButton(tr("welcome.mcp.copy_command_btn"))
+        self._mcp_copy_cmd_btn.clicked.connect(self._copy_mcp_command)
+        mcp_btn_row.addWidget(self._mcp_copy_cmd_btn)
+        mcp_btn_row.addStretch()
+        mg_layout.addLayout(mcp_btn_row)
+
+        self._mcp_status = QLabel("")
+        self._mcp_status.setObjectName("spinePathStatus")
+        self._mcp_status.setProperty("role", "info")
+        self._mcp_status.setWordWrap(True)
+        self._mcp_status.hide()
+        mg_layout.addWidget(self._mcp_status)
+
+        self._mcp_steps = QLabel(tr("welcome.mcp.steps"))
+        self._mcp_steps.setWordWrap(True)
+        self._mcp_steps.setProperty("role", "info")
+        mg_layout.addWidget(self._mcp_steps)
+
+        self._mcp_examples = QLabel(tr("welcome.mcp.examples"))
+        self._mcp_examples.setWordWrap(True)
+        self._mcp_examples.setProperty("role", "info")
+        self._mcp_examples.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        mg_layout.addWidget(self._mcp_examples)
+
+        cl.addWidget(self._mcp_group)
+
         # Update banner (hidden by default)
         self._update_banner = QFrame()
         self._update_banner.setObjectName("updateBanner")
@@ -124,18 +185,13 @@ class WelcomePage(QWidget):
         self._update_banner.hide()
         cl.addWidget(self._update_banner)
 
-        # Store update info
-        self._pending_update_url = ""
-        self._pending_update_changelog = ""
-        self._update_worker = None
-
         # Center container horizontally
         h = QHBoxLayout()
         h.addStretch()
         h.addWidget(container)
         h.addStretch()
-        outer.addLayout(h)
-        outer.addStretch(3)
+        body_layout.addLayout(h)
+        body_layout.addStretch(3)
 
     # -- Path handling --
 
@@ -207,10 +263,50 @@ class WelcomePage(QWidget):
     # -- Auto-update --
 
     def show_update_available(self, version: str, zipball_url: str, changelog: str):
-        self._pending_update_url = zipball_url
-        self._pending_update_changelog = changelog
+        self._update_label.setToolTip(changelog or "")
         self._update_label.setText(tr("update.available", version=version))
         self._update_banner.show()
+
+    # -- Claude / MCP quick start --
+
+    def _set_mcp_status(self, role: str, text: str):
+        self._mcp_status.setText(text)
+        self._mcp_status.setProperty("role", role)
+        self._mcp_status.style().unpolish(self._mcp_status)
+        self._mcp_status.style().polish(self._mcp_status)
+        self._mcp_status.show()
+
+    def _connect_claude_desktop(self):
+        config_path = claude_desktop_config_path()
+        reply = QMessageBox.question(
+            self, tr("welcome.mcp.confirm_title"),
+            tr("welcome.mcp.confirm", path=config_path),
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            result = install_claude_desktop_config(config_path)
+        except FileNotFoundError:
+            self._set_mcp_status("error", tr("welcome.mcp.not_installed"))
+            return
+        except (OSError, ValueError) as e:
+            self._set_mcp_status(
+                "error", tr("welcome.mcp.failed", path=config_path, error=str(e)))
+            return
+        if result["status"] == "unchanged":
+            self._set_mcp_status("ok", tr("welcome.mcp.already", path=result["path"]))
+        else:
+            self._set_mcp_status("ok", tr("welcome.mcp.connected", path=result["path"]))
+
+    def _copy_mcp_config(self):
+        QApplication.clipboard().setText(claude_desktop_config_snippet())
+        self._set_mcp_status(
+            "ok", tr("welcome.mcp.copied_config", path=claude_desktop_config_path()))
+
+    def _copy_mcp_command(self):
+        QApplication.clipboard().setText(claude_code_command())
+        self._set_mcp_status("ok", tr("welcome.mcp.copied_command"))
 
     def _do_update(self):
         import webbrowser
@@ -231,6 +327,14 @@ class WelcomePage(QWidget):
         self._btn_spine.setText(tr("welcome.btn_spine"))
         self._btn_json.setText(tr("welcome.btn_json"))
         self._info.setText(tr("welcome.info_spine"))
+        self._mcp_group.setTitle(tr("welcome.mcp.group"))
+        self._mcp_intro.setText(tr("welcome.mcp.intro"))
+        self._mcp_steps.setText(tr("welcome.mcp.steps"))
+        self._mcp_examples.setText(tr("welcome.mcp.examples"))
+        self._mcp_connect_btn.setText(tr("welcome.mcp.connect_btn"))
+        self._mcp_copy_cfg_btn.setText(tr("welcome.mcp.copy_config_btn"))
+        self._mcp_copy_cmd_btn.setText(tr("welcome.mcp.copy_command_btn"))
+        self._mcp_status.hide()
         # Re-validate to update status text
         text = self._path_edit.text().strip()
         if not text:

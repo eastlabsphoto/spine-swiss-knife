@@ -3,9 +3,10 @@ Polygon Simplify tab — reduce vertex count on complex clipping masks
 using Ramer-Douglas-Peucker algorithm, with live Canvas preview.
 """
 
+from __future__ import annotations
+
 import math
 import os
-import shutil
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
@@ -16,7 +17,10 @@ from PySide6.QtGui import QPainter, QPen, QColor, QBrush, QFont
 from PySide6.QtCore import Qt, QPointF
 
 from .i18n import tr, language_changed
-from .spine_json import load_spine_json, save_spine_json, normalize_skins, iter_clipping_attachments
+from .spine_json import (
+    load_spine_json, save_spine_json, normalize_skins, iter_clipping_attachments,
+    create_backup, is_weighted, iter_deform_timelines,
+)
 from .style import CANVAS_BG, SUBTEXT
 
 
@@ -414,10 +418,12 @@ class PolygonSimplifyTab:
         total = len(self._masks)
         total_orig = sum(m["vertex_count"] for m in self._masks)
         total_simp = sum(len(m["simplified_points"]) for m in self._masks)
-        self._stats.setText(
-            tr("polygon.stats", total=total, orig=total_orig,
-               simp=total_simp, reduced=total_orig - total_simp)
-        )
+        text = tr("polygon.stats", total=total, orig=total_orig,
+                  simp=total_simp, reduced=total_orig - total_simp)
+        skipped = getattr(self, "_skipped_masks", 0)
+        if skipped:
+            text += "  |  " + tr("polygon.skipped_masks", count=skipped)
+        self._stats.setText(text)
 
     # ------------------------------------------------------------------
     # Analysis (called from app.py on JSON selection)
@@ -436,9 +442,19 @@ class PolygonSimplifyTab:
 
         skins = normalize_skins(spine_data.get("skins", {}))
         self._masks = []
+        self._skipped_masks = 0
         default_epsilon = 5.0
 
+        deformed = set()
+        for anim in (spine_data.get("animations") or {}).values():
+            if isinstance(anim, dict):
+                for _sk, d_slot, d_att, _keys in iter_deform_timelines(anim):
+                    deformed.add((d_slot, d_att))
+
         for skin_name, slot_name, att_name, att_data in iter_clipping_attachments(skins):
+            if is_weighted(att_data) or (slot_name, att_name) in deformed:
+                self._skipped_masks += 1
+                continue
             vc = att_data.get("vertexCount", 0)
             verts = att_data.get("vertices", [])
             points = list(zip(verts[::2], verts[1::2]))
@@ -494,7 +510,7 @@ class PolygonSimplifyTab:
             return
 
         try:
-            shutil.copy2(json_path, json_path + ".backup")
+            create_backup(json_path)
             spine_data = load_spine_json(json_path)
         except Exception as e:
             QMessageBox.critical(None, tr("err.title"), tr("err.load_backup", error=e))

@@ -1,7 +1,8 @@
 """Rectangle Masks tab — snap almost-rectangle clipping masks to clean rectangles, with preview."""
 
+from __future__ import annotations
+
 import os
-import shutil
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QLineEdit,
@@ -12,43 +13,9 @@ from PySide6.QtGui import QPainter, QPen, QColor, QBrush, QFont
 from PySide6.QtCore import Qt, QPointF
 
 from .i18n import tr, language_changed
-from .spine_json import load_spine_json, save_spine_json, normalize_skins, iter_clipping_attachments
+from .spine_json import load_spine_json, save_spine_json, normalize_skins, iter_clipping_attachments, create_backup
+from .mask_core import analyze_clipping  # noqa: F401  (re-exported)
 from .style import CANVAS_BG, SUBTEXT
-
-
-# ==========================================================================
-# Analysis logic (unchanged)
-# ==========================================================================
-
-def analyze_clipping(att_data: dict, tolerance: float = 5.0) -> dict:
-    vc = att_data.get("vertexCount", 0)
-    verts = att_data.get("vertices", [])
-    points = list(zip(verts[::2], verts[1::2]))
-    info = {"vertex_count": vc, "vertices": verts, "points": points, "is_rect_candidate": False}
-
-    if vc != 4 or len(verts) != 8:
-        return info
-
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
-    x_min, x_max = min(xs), max(xs)
-    y_min, y_max = min(ys), max(ys)
-    snapped_xs = [x_min if abs(x - x_min) < abs(x - x_max) else x_max for x in xs]
-    snapped_ys = [y_min if abs(y - y_min) < abs(y - y_max) else y_max for y in ys]
-    max_dev = max(
-        max(abs(x - sx) for x, sx in zip(xs, snapped_xs)),
-        max(abs(y - sy) for y, sy in zip(ys, snapped_ys)),
-    )
-    if max_dev <= tolerance and len(set(snapped_xs)) == 2 and len(set(snapped_ys)) == 2:
-        snapped_verts = []
-        for sx, sy in zip(snapped_xs, snapped_ys):
-            snapped_verts.append(round(sx))
-            snapped_verts.append(round(sy))
-        info["is_rect_candidate"] = True
-        info["max_deviation"] = round(max_dev, 2)
-        info["snapped_vertices"] = snapped_verts
-        info["snapped_points"] = list(zip(snapped_verts[::2], snapped_verts[1::2]))
-    return info
 
 
 # ==========================================================================
@@ -358,7 +325,15 @@ class MaskOptimizerTab:
                 self._fixable.append({"skin": skin_name, "slot": slot_name, "att_name": att_name, "info": info})
             else:
                 vc = info["vertex_count"]
-                reason = tr("mask.reason.not4", count=vc) if vc != 4 else tr("mask.reason.too_large", tol=tolerance)
+                code = info.get("skip_code")
+                if code == "weighted":
+                    reason = tr("mask.reason.weighted")
+                elif code == "duplicate_corners":
+                    reason = tr("mask.reason.duplicate_corners")
+                elif vc != 4:
+                    reason = tr("mask.reason.not4", count=vc)
+                else:
+                    reason = tr("mask.reason.too_large", tol=tolerance)
                 self._skipped.append({"skin": skin_name, "slot": slot_name, "att_name": att_name, "info": info, "reason": reason})
                 QTreeWidgetItem(self._skip_tree, [slot_name, att_name, str(vc), reason])
 
@@ -383,7 +358,7 @@ class MaskOptimizerTab:
             return
 
         try:
-            shutil.copy2(json_path, json_path + ".backup")
+            create_backup(json_path)
             spine_data = load_spine_json(json_path)
         except Exception as e:
             QMessageBox.critical(None, tr("err.title"), tr("err.load_backup", error=e))

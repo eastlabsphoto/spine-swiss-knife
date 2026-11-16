@@ -1,7 +1,8 @@
 """Image Downscaler tab — downscale images via _DOWNSCALE/<percent>/ folders, update JSON."""
 
+from __future__ import annotations
+
 import os
-import shutil
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QLineEdit,
@@ -10,54 +11,11 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 
 from .i18n import tr, language_changed
-from .spine_json import (
-    load_spine_json, save_spine_json, normalize_skins,
-    iter_region_attachments, attachment_image_key,
+from .spine_json import load_spine_json
+from .downscale_core import (  # noqa: F401  (re-exported)
+    IMAGE_EXTS, Image, resize_image, scan_downscale_folder, build_plan,
+    process_plan, move_to_originals,
 )
-
-try:
-    from PIL import Image
-except ImportError:
-    Image = None
-
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tga", ".webp"}
-
-
-def resize_image(src_path: str, dst_path: str, scale_percent: int):
-    if Image is None:
-        raise RuntimeError("Pillow (PIL) is not installed. Run: pip3 install Pillow")
-    img = Image.open(src_path)
-    factor = scale_percent / 100.0
-    new_w = max(1, round(img.width * factor))
-    new_h = max(1, round(img.height * factor))
-    resized = img.resize((new_w, new_h), Image.LANCZOS)
-    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-    resized.save(dst_path)
-    return new_w, new_h
-
-
-def scan_downscale_folder(downscale_dir: str) -> dict[int, list[str]]:
-    result = {}
-    if not os.path.isdir(downscale_dir):
-        return result
-    for entry in sorted(os.listdir(downscale_dir)):
-        folder_path = os.path.join(downscale_dir, entry)
-        if not os.path.isdir(folder_path):
-            continue
-        try:
-            percent = int(entry)
-        except ValueError:
-            continue
-        if percent <= 0 or percent >= 100:
-            continue
-        images = []
-        for root, dirs, files in os.walk(folder_path):
-            for fname in files:
-                if os.path.splitext(fname)[1].lower() in IMAGE_EXTS:
-                    images.append(os.path.join(root, fname))
-        if images:
-            result[percent] = sorted(images)
-    return result
 
 
 class OptimizerTab:
@@ -178,62 +136,27 @@ class OptimizerTab:
             QMessageBox.critical(None, tr("err.title"), tr("err.parse_json", error=e))
             return
 
-        att_lookup = {}
-        skins = normalize_skins(spine_data.get("skins", {}))
-        for skin_name, slot_name, att_name, att_data in iter_region_attachments(skins):
-            key = attachment_image_key(att_name, att_data)
-            att_lookup.setdefault(key, []).append((skin_name, slot_name, att_name, att_data))
-
-        self._opt_plan = []
+        self._opt_plan = build_plan(ds_dir, images_dir, spine_data)
         warnings = []
-
-        for percent, file_list in sorted(ds_map.items()):
-            inv_factor = 100.0 / percent
-            pct_dir = os.path.join(ds_dir, str(percent))
-            for src_path in file_list:
-                rel_to_pct = os.path.relpath(src_path, pct_dir)
-                image_key = os.path.splitext(rel_to_pct)[0]
-                dst_path = os.path.join(images_dir, rel_to_pct)
-
-                orig_w, orig_h = "?", "?"
-                if Image:
-                    try:
-                        with Image.open(src_path) as img:
-                            orig_w, orig_h = img.width, img.height
-                    except Exception:
-                        pass
-
-                new_w = max(1, round(orig_w * percent / 100)) if isinstance(orig_w, int) else "?"
-                new_h = max(1, round(orig_h * percent / 100)) if isinstance(orig_h, int) else "?"
-
-                matches = att_lookup.get(image_key, [])
-                if not matches:
-                    for k, v in att_lookup.items():
-                        if k.lower() == image_key.lower():
-                            matches = v
-                            break
-
-                current_scales = set()
-                for _, _, _, ad in matches:
-                    current_scales.add((ad.get("scaleX", 1), ad.get("scaleY", 1)))
-
-                if not matches:
-                    warnings.append(tr("optimizer.no_attachment", key=image_key))
-
-                if current_scales:
-                    rep_sx, rep_sy = list(current_scales)[0]
-                    cur_str = f"{rep_sx}, {rep_sy}"
-                    new_str = f"{round(rep_sx * inv_factor, 4)}, {round(rep_sy * inv_factor, 4)}"
-                else:
-                    cur_str = "1, 1"
-                    new_str = f"{inv_factor}, {inv_factor}"
-
-                self._opt_plan.append({
-                    "src_path": src_path, "dst_path": dst_path, "image_key": image_key,
-                    "percent": percent, "inv_factor": inv_factor, "matches": matches,
-                    "orig_size": f"{orig_w}x{orig_h}", "new_size": f"{new_w}x{new_h}",
-                    "cur_scale_str": cur_str, "new_scale_str": new_str,
-                })
+        for item in self._opt_plan:
+            orig_w, orig_h = item["orig_w"], item["orig_h"]
+            item["orig_size"] = f"{orig_w}x{orig_h}" if orig_w else "?x?"
+            item["new_size"] = f"{item['new_w']}x{item['new_h']}" if orig_w else "?x?"
+            inv_factor = item["inv_factor"]
+            if not item["matches"]:
+                warnings.append(tr("optimizer.no_attachment", key=item["image_key"]))
+            region_scales = [(ad.get("scaleX", 1), ad.get("scaleY", 1))
+                             for _, _, _, ad in item["matches"]
+                             if ad.get("type") in (None, "region")]
+            if region_scales:
+                rep_sx, rep_sy = region_scales[0]
+                item["cur_scale_str"] = f"{rep_sx}, {rep_sy}"
+                item["new_scale_str"] = f"{round(rep_sx * inv_factor, 4)}, {round(rep_sy * inv_factor, 4)}"
+            elif item["matches"]:  # mesh only: geometry is independent of image size
+                item["cur_scale_str"] = item["new_scale_str"] = "-"
+            else:
+                item["cur_scale_str"] = "1, 1"
+                item["new_scale_str"] = f"{inv_factor}, {inv_factor}"
 
         self._tree.clear()
         for item in self._opt_plan:
@@ -269,56 +192,20 @@ class OptimizerTab:
             tr("optimizer.confirm.resize", count=count)) != QMessageBox.Yes:
             return
 
+        images_dir = self._get_config("images")
         try:
-            shutil.copy2(json_path, json_path + ".backup")
-            spine_data = load_spine_json(json_path)
+            res = process_plan(json_path, images_dir, self._opt_plan)
         except Exception as e:
             QMessageBox.critical(None, tr("err.title"), tr("err.load_backup", error=e))
             return
-
-        skins = normalize_skins(spine_data.get("skins", {}))
-        att_lookup = {}
-        for skin_name, slot_name, att_name, att_data in iter_region_attachments(skins):
-            key = attachment_image_key(att_name, att_data)
-            att_lookup.setdefault(key, []).append((skin_name, slot_name, att_name, att_data))
-
-        resized = json_updated = 0
-        errors = []
-        for item in self._opt_plan:
-            try:
-                new_w, new_h = resize_image(item["src_path"], item["dst_path"], item["percent"])
-                resized += 1
-            except Exception as e:
-                errors.append(f"Resize {item['image_key']}: {e}")
-                continue
-
-            matches = att_lookup.get(item["image_key"], [])
-            if not matches:
-                for k, v in att_lookup.items():
-                    if k.lower() == item["image_key"].lower():
-                        matches = v
-                        break
-
-            inv = item["inv_factor"]
-            for _, _, _, att_data in matches:
-                att_data["scaleX"] = round(att_data.get("scaleX", 1) * inv, 6)
-                att_data["scaleY"] = round(att_data.get("scaleY", 1) * inv, 6)
-                att_data["width"] = new_w
-                att_data["height"] = new_h
-                json_updated += 1
-
-            try:
-                os.remove(item["src_path"])
-            except OSError:
-                pass
-
-        try:
-            save_spine_json(json_path, spine_data)
-        except Exception as e:
-            QMessageBox.critical(None, tr("err.title"), tr("err.save_json", error=e))
+        if not res["json_saved"]:
+            QMessageBox.critical(
+                None, tr("err.title"),
+                tr("err.save_json", error=res["save_error"]) + "\n\n"
+                + tr("optimizer.sources_kept"))
             return
+        resized, json_updated, errors = res["resized"], res["json_updated"], res["errors"]
 
-        images_dir = self._get_config("images")
         ds_dir = os.path.join(images_dir, "_DOWNSCALE")
         for dirpath, _, _ in os.walk(ds_dir, topdown=False):
             if not os.listdir(dirpath) and dirpath != ds_dir:
@@ -328,6 +215,8 @@ class OptimizerTab:
                     pass
 
         msg = tr("optimizer.done", resized=resized, total=count, json_updated=json_updated, backup=json_path + ".backup")
+        msg += "\n\n" + tr("optimizer.originals_moved", count=res["moved"],
+                            dir=os.path.join(images_dir, "_ORIGINALS"))
         if errors:
             msg += f"\n\nErrors ({len(errors)}):\n" + "\n".join(errors[:10])
         QMessageBox.information(None, tr("done.title"), msg)

@@ -1,5 +1,7 @@
 """Entry point for: python -m spine_swiss_knife"""
 
+from __future__ import annotations
+
 import sys
 
 from .launcher import dispatch

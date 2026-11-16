@@ -1,7 +1,8 @@
-"""Keyframe Optimizer tab — detect and remove redundant animation keyframes from Spine 3.x JSON."""
+"""Keyframe Optimizer tab — detect and remove redundant animation keyframes from Spine JSON."""
+
+from __future__ import annotations
 
 import os
-import shutil
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QLineEdit,
@@ -11,154 +12,10 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 
 from .i18n import tr, language_changed
-from .spine_json import load_spine_json, save_spine_json
-
-
-# ==========================================================================
-# Keyframe redundancy detection (unchanged)
-# ==========================================================================
-
-_BONE_TIMELINE_FIELDS = {
-    "translate": ("x", "y"), "rotate": ("angle",),
-    "scale": ("x", "y"), "shear": ("x", "y"),
-}
-_SLOT_TIMELINE_FIELDS = {"color": ("color",)}
-_DEFAULTS = {"x": 0, "y": 0, "angle": 0, "color": "ffffffff"}
-
-
-def _color_to_floats(color_hex: str) -> tuple[float, ...]:
-    color_hex = color_hex.lower()
-    r = int(color_hex[0:2], 16) / 255.0
-    g = int(color_hex[2:4], 16) / 255.0
-    b = int(color_hex[4:6], 16) / 255.0
-    a = int(color_hex[6:8], 16) / 255.0
-    return (r, g, b, a)
-
-
-def _get_numeric_values(keyframe: dict, fields: tuple[str, ...]) -> list[float]:
-    values: list[float] = []
-    for field in fields:
-        raw = keyframe.get(field, _DEFAULTS.get(field, 0))
-        if field == "color":
-            values.extend(_color_to_floats(str(raw)))
-        else:
-            values.append(float(raw))
-    return values
-
-
-def _is_redundant(prev, cur, nxt, fields, tolerance):
-    t_prev = prev.get("time", 0)
-    t_cur = cur.get("time", 0)
-    t_next = nxt.get("time", 0)
-    dt = t_next - t_prev
-    if dt == 0:
-        return False
-    t_ratio = (t_cur - t_prev) / dt
-    vals_prev = _get_numeric_values(prev, fields)
-    vals_cur = _get_numeric_values(cur, fields)
-    vals_next = _get_numeric_values(nxt, fields)
-    for vp, vc, vn in zip(vals_prev, vals_cur, vals_next):
-        expected = vp + t_ratio * (vn - vp)
-        if abs(expected - vc) >= tolerance:
-            return False
-    return True
-
-
-def _has_curve(keyframe):
-    return "curve" in keyframe
-
-
-def find_redundant_keyframes(animations, tolerance):
-    results = {}
-    for anim_name, anim_data in animations.items():
-        anim_result = {"bones": {}, "slots": {}, "total_keys": 0, "redundant_keys": 0}
-
-        bones = anim_data.get("bones", {})
-        for bone_name, timelines in bones.items():
-            bone_redundant = {}
-            for tl_type, fields in _BONE_TIMELINE_FIELDS.items():
-                keys = timelines.get(tl_type)
-                if not keys or len(keys) < 3:
-                    if keys:
-                        anim_result["total_keys"] += len(keys)
-                    continue
-                anim_result["total_keys"] += len(keys)
-                redundant_indices = []
-                for i in range(1, len(keys) - 1):
-                    if _has_curve(keys[i - 1]) or _has_curve(keys[i]):
-                        continue
-                    if _is_redundant(keys[i - 1], keys[i], keys[i + 1], fields, tolerance):
-                        redundant_indices.append(i)
-                if redundant_indices:
-                    bone_redundant[tl_type] = redundant_indices
-                    anim_result["redundant_keys"] += len(redundant_indices)
-            if bone_redundant:
-                anim_result["bones"][bone_name] = bone_redundant
-
-        slots = anim_data.get("slots", {})
-        for slot_name, timelines in slots.items():
-            slot_redundant = {}
-            for tl_type, fields in _SLOT_TIMELINE_FIELDS.items():
-                keys = timelines.get(tl_type)
-                if not keys or len(keys) < 3:
-                    if keys:
-                        anim_result["total_keys"] += len(keys)
-                    continue
-                anim_result["total_keys"] += len(keys)
-                redundant_indices = []
-                for i in range(1, len(keys) - 1):
-                    if _has_curve(keys[i - 1]) or _has_curve(keys[i]):
-                        continue
-                    if _is_redundant(keys[i - 1], keys[i], keys[i + 1], fields, tolerance):
-                        redundant_indices.append(i)
-                if redundant_indices:
-                    slot_redundant[tl_type] = redundant_indices
-                    anim_result["redundant_keys"] += len(redundant_indices)
-            att_keys = timelines.get("attachment")
-            if att_keys:
-                anim_result["total_keys"] += len(att_keys)
-            if slot_redundant:
-                anim_result["slots"][slot_name] = slot_redundant
-
-        if anim_result["total_keys"] > 0:
-            results[anim_name] = anim_result
-    return results
-
-
-def remove_redundant_keyframes(spine_data, analysis):
-    animations = spine_data.get("animations", {})
-    removed = 0
-    for anim_name, info in analysis.items():
-        anim_data = animations.get(anim_name)
-        if anim_data is None:
-            continue
-        bones = anim_data.get("bones", {})
-        for bone_name, timelines in info["bones"].items():
-            bone_data = bones.get(bone_name)
-            if bone_data is None:
-                continue
-            for tl_type, indices in timelines.items():
-                keys = bone_data.get(tl_type)
-                if keys is None:
-                    continue
-                for idx in reversed(indices):
-                    if idx < len(keys):
-                        keys.pop(idx)
-                        removed += 1
-        slots = anim_data.get("slots", {})
-        for slot_name, timelines in info["slots"].items():
-            slot_data = slots.get(slot_name)
-            if slot_data is None:
-                continue
-            for tl_type, indices in timelines.items():
-                keys = slot_data.get(tl_type)
-                if keys is None:
-                    continue
-                for idx in reversed(indices):
-                    if idx < len(keys):
-                        keys.pop(idx)
-                        removed += 1
-    return removed
+from .spine_json import load_spine_json, save_spine_json, create_backup
+from .keyframe_core import (  # noqa: F401  (re-exported)
+    find_redundant_keyframes, remove_redundant_keyframes, redundant_indices,
+)
 
 
 # ==========================================================================
@@ -171,13 +28,14 @@ class KeyframeOptimizerTab:
         self._on_modified = on_modified
         self._tabs = tabs
         self._analysis = {}
+        self._stats_state = ("keyframe.default_stats", {})
 
         self._page = QWidget()
         tabs.addTab(self._page, tr("keyframe.tab"))
         layout = QVBoxLayout(self._page)
         layout.setContentsMargins(5, 5, 5, 5)
 
-        self._info = QLabel(tr("keyframe.info"))
+        self._info = QLabel(tr("keyframe.info2"))
         self._info.setWordWrap(True)
         layout.addWidget(self._info)
 
@@ -234,18 +92,24 @@ class KeyframeOptimizerTab:
         idx = self._tabs.indexOf(self._page)
         if idx >= 0:
             self._tabs.setTabText(idx, tr("keyframe.tab"))
-        self._info.setText(tr("keyframe.info"))
+        self._info.setText(tr("keyframe.info2"))
         self._tol_label.setText(tr("keyframe.tolerance_label"))
         self._select_all_btn.setText(tr("keyframe.select_all"))
         self._unselect_all_btn.setText(tr("keyframe.unselect_all"))
         self._remove_btn.setText(tr("keyframe.remove_btn"))
-        self._stats.setText(tr("keyframe.default_stats"))
+        self._set_stats(*self._stats_state)
         self._tree.setHeaderLabels([
             tr("keyframe.tree.animation"), tr("keyframe.tree.total"),
             tr("keyframe.tree.redundant"), tr("keyframe.tree.reduction"),
         ])
 
-    def _analyze(self):
+    def _set_stats(self, key, kwargs):
+        self._stats_state = (key, kwargs)
+        self._stats.setText(tr(key, **kwargs))
+
+    def _analyze(self, silent=False):
+        """Scan for redundant keys; *silent* suppresses the 'no animations'
+        information box (used by the automatic refresh)."""
         json_path = self._get_config("json")
         if not json_path or not os.path.isfile(json_path):
             QMessageBox.critical(None, tr("err.title"), tr("err.no_json"))
@@ -263,13 +127,14 @@ class KeyframeOptimizerTab:
 
         animations = spine_data.get("animations", {})
         if not animations:
-            QMessageBox.information(None, tr("keyframe.no_anims_title"), tr("keyframe.no_anims"))
+            if not silent:
+                QMessageBox.information(None, tr("keyframe.no_anims_title"), tr("keyframe.no_anims"))
             self._analysis = {}
             self._tree.clear()
             self._remove_btn.setEnabled(False)
             return
 
-        self._analysis = find_redundant_keyframes(animations, tolerance)
+        self._analysis = find_redundant_keyframes(animations, tolerance, spine_data)
         self._tree.clear()
         grand_total = grand_redundant = 0
 
@@ -286,12 +151,11 @@ class KeyframeOptimizerTab:
             item.setCheckState(0, Qt.Checked)
 
         if grand_total > 0:
-            self._stats.setText(
-                tr("keyframe.stats", anims=len(self._analysis), total=grand_total,
-                   redundant=grand_redundant, pct=f"{grand_redundant / grand_total * 100:.1f}")
-            )
+            self._set_stats("keyframe.stats", dict(
+                anims=len(self._analysis), total=grand_total,
+                redundant=grand_redundant, pct=f"{grand_redundant / grand_total * 100:.1f}"))
         else:
-            self._stats.setText(tr("keyframe.stats_zero", anims=len(self._analysis)))
+            self._set_stats("keyframe.stats_zero", dict(anims=len(self._analysis)))
 
         self._remove_btn.setEnabled(grand_redundant > 0)
 
@@ -321,7 +185,7 @@ class KeyframeOptimizerTab:
             return
 
         try:
-            shutil.copy2(json_path, json_path + ".backup")
+            create_backup(json_path)
             spine_data = load_spine_json(json_path)
         except Exception as e:
             QMessageBox.critical(None, tr("err.title"), tr("err.load_backup", error=e))
@@ -339,6 +203,6 @@ class KeyframeOptimizerTab:
         self._analysis = {}
         self._tree.clear()
         self._remove_btn.setEnabled(False)
-        self._stats.setText(tr("keyframe.done_stats"))
+        self._set_stats("keyframe.done_stats", {})
         if self._on_modified:
             self._on_modified()

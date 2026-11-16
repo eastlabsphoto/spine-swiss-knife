@@ -1,5 +1,7 @@
 """Persistent application settings backed by QSettings."""
 
+from __future__ import annotations
+
 from PySide6.QtCore import QSettings
 
 _ORG = "GreentubeSK"

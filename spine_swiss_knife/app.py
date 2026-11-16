@@ -1,9 +1,11 @@
 """Main application window — sidebar navigation, config panel, dark theme."""
 
+from __future__ import annotations
+
 import json
 import os
+import re
 import shutil
-import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -13,7 +15,7 @@ from PySide6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QTabWidget, QFileDialog,
     QStackedWidget, QSizePolicy, QComboBox, QFrame, QMessageBox,
     QProgressDialog, QApplication, QDialog, QDialogButtonBox,
-    QFormLayout,
+    QFormLayout, QListWidget, QListWidgetItem, QInputDialog,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon
@@ -23,6 +25,11 @@ from .i18n import tr, language_changed
 from .settings import settings
 from .spine_cli import export_spine_project, import_to_spine_project
 from .spine_downgrader import SpineDowngraderTab, convert_to_destination
+from .spine_json import (
+    create_backup, list_backups, load_spine_json, save_spine_json,
+)
+from .spine_validate import validate_skeleton
+from .atlas_parser import parse_atlas
 from .image_flattener import ImageFlattenerTab
 from .merge_skeletons import MergeSkeletonsTab
 from .welcome_page import WelcomePage
@@ -37,12 +44,12 @@ from .blend_switcher import BlendSwitcherTab
 from .draw_order_optimizer import DrawOrderOptimizerTab
 from .slot_renamer import SlotRenamerTab
 from .splitter import SplitterTab
-from .spine_downgrader import SpineDowngraderTab
 from .texture_unpacker import TextureUnpackerTab
 from .spine_viewer import SpineViewerTab
 from .static_exporter import StaticExporterTab
 from .mcp_setup import McpSetupTab
-from .debug_log import DebugConsole
+from .debug_log import DebugConsole, log_error, log_exception
+from .unused_finder import UnusedFinderTab
 
 
 _SIDEBAR_KEYS = [
@@ -53,6 +60,7 @@ _SIDEBAR_KEYS = [
     ("app.sidebar.keyframes", "app.tip.keyframes"),
     ("app.sidebar.dead_bones", "app.tip.dead_bones"),
     ("app.sidebar.hidden", "app.tip.hidden"),
+    ("app.sidebar.unused", "app.tip.unused"),
     ("app.sidebar.blend", "app.tip.blend"),
     ("app.sidebar.draw_order", "app.tip.draw_order"),
     ("app.sidebar.renamer", "app.tip.renamer"),
@@ -65,6 +73,115 @@ _SIDEBAR_KEYS = [
     ("app.sidebar.viewer", "app.tip.viewer"),
     ("app.sidebar.mcp", "app.tip.mcp"),
 ]
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers (no widgets) — kept module-level so they can be unit tested.
+# ---------------------------------------------------------------------------
+
+def _norm_path(path: str) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _atlas_stem(path: str) -> str:
+    name = os.path.basename(path)
+    for ext in (".atlas.txt", ".atlas"):
+        if name.lower().endswith(ext):
+            return name[:-len(ext)]
+    return os.path.splitext(name)[0]
+
+
+def pair_atlas(json_path: str, atlases, default: str = "") -> str:
+    """Atlas of *json_path* by file stem; *default* when none matches."""
+    stem = Path(json_path).stem
+    for a in atlases or []:
+        if _atlas_stem(a) == stem:
+            return a
+    return default
+
+
+def resolve_images_dir(json_path: str, data) -> str:
+    """``skeleton.images`` (relative to the JSON) when it is an existing folder."""
+    try:
+        images = data.get("skeleton", {}).get("images", "")
+    except AttributeError:
+        return ""
+    if not isinstance(images, str) or not images.strip():
+        return ""
+    candidate = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(json_path)), images))
+    return candidate if os.path.isdir(candidate) else ""
+
+
+def import_plan(json_path: str, export_jsons) -> list:
+    """JSON files to import, in order, when saving back into a .spine project.
+
+    With several exported skeletons every one is imported (the edited one in
+    its place); otherwise just *json_path*.
+    """
+    export_jsons = list(export_jsons or [])
+    if len(export_jsons) > 1:
+        mine = _norm_path(json_path)
+        if any(_norm_path(j) == mine for j in export_jsons):
+            return [json_path if _norm_path(j) == mine else j for j in export_jsons]
+    return [json_path]
+
+
+def restore_spine_backup(backup_path, spine_path) -> bool:
+    """Put *backup_path* back as *spine_path*; a partial file is removed first."""
+    try:
+        backup = Path(backup_path)
+        spine = Path(spine_path)
+        if not backup.is_file():
+            return False
+        if spine.exists():
+            spine.unlink()
+        shutil.copy2(str(backup), str(spine))
+        return spine.is_file()
+    except OSError:
+        return False
+
+
+_BACKUP_STAMP_RE = re.compile(r"\.(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})_\d{6}\.json$")
+
+
+def describe_backup(path: str) -> str:
+    """'YYYY-MM-DD HH:MM:SS  (12.3 KB)' for a history backup file."""
+    m = _BACKUP_STAMP_RE.search(os.path.basename(path))
+    stamp = ("%s-%s-%s %s:%s:%s" % m.groups()) if m else os.path.basename(path)
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    return "%s  (%.1f KB)" % (stamp, size / 1024.0)
+
+
+def restore_json_backup(json_path: str, backup_path: str) -> None:
+    """Replace *json_path* by *backup_path*; the current file is backed up first.
+
+    The chosen backup is read before ``create_backup`` runs (which prunes old
+    history files and could otherwise delete it).
+    """
+    with open(backup_path, "rb") as f:
+        content = f.read()
+    if os.path.isfile(json_path):
+        create_backup(json_path)
+    tmp = json_path + ".restore.tmp"
+    with open(tmp, "wb") as f:
+        f.write(content)
+    os.replace(tmp, json_path)
+
+
+def summarize_issues(issues) -> tuple:
+    """``(errors, warnings, details_text)`` for a validate_skeleton result."""
+    errors = [i for i in issues if i.get("severity") == "error"]
+    warnings = [i for i in issues if i.get("severity") != "error"]
+    lines = []
+    for i in errors + warnings:
+        lines.append("[%s] %s: %s (%s)" % (
+            i.get("severity", "warning").upper(), i.get("where", ""),
+            i.get("message", ""), i.get("code", "")))
+    return len(errors), len(warnings), "\n".join(lines)
+
 
 
 class SpineSwissKnifeApp(QMainWindow):
@@ -80,7 +197,12 @@ class SpineSwissKnifeApp(QMainWindow):
         self._mode = None            # "spine" / "json" / None
         self._spine_project_path = ""
         self._export_dir = ""
+        self._export_jsons: list = []   # every JSON exported from a .spine project
+        self._spine_pack_atlas = True
         self._sidebar_btns = []
+        self._validation_state = None   # None | ("ok",) | ("issues", e, w) | ("unreadable",)
+        self._validation_details = ""
+        self._refreshing = False
 
         self._build_ui()
         language_changed.connect(self._retranslate)
@@ -191,6 +313,10 @@ class SpineSwissKnifeApp(QMainWindow):
         self._btn_json = QPushButton(tr("app.browse"))
         self._btn_json.clicked.connect(self._browse_json)
         json_btn_layout.addWidget(self._btn_json)
+        self._btn_restore = QPushButton(tr("app.restore_btn"))
+        self._btn_restore.setCursor(Qt.PointingHandCursor)
+        self._btn_restore.clicked.connect(self._restore_backup_dialog)
+        json_btn_layout.addWidget(self._btn_restore)
         self._btn_export_atlas = QPushButton(tr("json_mode.export_atlas_btn"))
         self._btn_export_atlas.setCursor(Qt.PointingHandCursor)
         self._btn_export_atlas.clicked.connect(self._export_atlas_from_json)
@@ -227,6 +353,17 @@ class SpineSwissKnifeApp(QMainWindow):
         config_grid.setColumnStretch(1, 1)
         main_layout.addWidget(config_panel)
 
+        # Skeleton validation status line (never blocks the UI)
+        self._validation_btn = QPushButton("")
+        self._validation_btn.setFlat(True)
+        self._validation_btn.setCursor(Qt.PointingHandCursor)
+        self._validation_btn.setStyleSheet(
+            "text-align: left; padding: 2px 6px; background: transparent;"
+            "border: none; font-weight: bold;")
+        self._validation_btn.clicked.connect(self._show_validation_details)
+        self._validation_btn.hide()
+        main_layout.addWidget(self._validation_btn)
+
         # Tool pages (hidden QTabWidget — sidebar controls it)
         tab_container = QWidget()
         tab_container_layout = QVBoxLayout(tab_container)
@@ -259,25 +396,35 @@ class SpineSwissKnifeApp(QMainWindow):
 
         # ── Create all tool tabs ──
         notify = self._run_all_tabs
+        # Named references (the order of _tab_instances is the sidebar order
+        # and must match _SIDEBAR_KEYS).
+        self._tab_analyzer = ProjectAnalyzerTab(self._tabs, self._get_config)
+        self._tab_optimizer = OptimizerTab(self._tabs, self._get_config, on_modified=notify)
+        self._tab_masks = MaskOptimizerTab(self._tabs, self._get_config, on_modified=notify)
+        self._tab_polygon = PolygonSimplifyTab(self._tabs, self._get_config, on_modified=notify)
+        self._tab_keyframes = KeyframeOptimizerTab(self._tabs, self._get_config, on_modified=notify)
+        self._tab_dead_bones = DeadBonesTab(self._tabs, self._get_config, on_modified=notify)
+        self._tab_hidden = HiddenAttachmentsTab(self._tabs, self._get_config, on_modified=notify)
+        self._tab_unused = UnusedFinderTab(self._tabs, self._get_config)
+        self._tab_blend = BlendSwitcherTab(self._tabs, self._get_config, on_modified=notify)
+        self._tab_draw_order = DrawOrderOptimizerTab(self._tabs, self._get_config, on_modified=notify)
+        self._tab_renamer = SlotRenamerTab(self._tabs, self._get_config, on_modified=notify)
+        self._tab_splitter = SplitterTab(self._tabs, self._get_config)
+        self._tab_converter = SpineDowngraderTab(self._tabs, self._get_config)
+        self._tab_unpacker = TextureUnpackerTab(self._tabs, self._get_config)
+        self._tab_static = StaticExporterTab(self._tabs, self._get_config)
+        self._tab_flattener = ImageFlattenerTab(self._tabs, self._get_config, on_modified=notify)
+        self._tab_merge = MergeSkeletonsTab(self._tabs, self._get_config)
+        self._tab_viewer = SpineViewerTab(self._tabs, self._get_config)
+        self._tab_mcp = McpSetupTab(self._tabs, self._get_config)
         self._tab_instances = [
-            ProjectAnalyzerTab(self._tabs, self._get_config),
-            OptimizerTab(self._tabs, self._get_config, on_modified=notify),
-            MaskOptimizerTab(self._tabs, self._get_config, on_modified=notify),
-            PolygonSimplifyTab(self._tabs, self._get_config, on_modified=notify),
-            KeyframeOptimizerTab(self._tabs, self._get_config, on_modified=notify),
-            DeadBonesTab(self._tabs, self._get_config, on_modified=notify),
-            HiddenAttachmentsTab(self._tabs, self._get_config, on_modified=notify),
-            BlendSwitcherTab(self._tabs, self._get_config, on_modified=notify),
-            DrawOrderOptimizerTab(self._tabs, self._get_config, on_modified=notify),
-            SlotRenamerTab(self._tabs, self._get_config, on_modified=notify),
-            SplitterTab(self._tabs, self._get_config),
-            SpineDowngraderTab(self._tabs, self._get_config),
-            TextureUnpackerTab(self._tabs, self._get_config),
-            StaticExporterTab(self._tabs, self._get_config),
-            ImageFlattenerTab(self._tabs, self._get_config, on_modified=notify),
-            MergeSkeletonsTab(self._tabs, self._get_config),
-            SpineViewerTab(self._tabs, self._get_config),
-            McpSetupTab(self._tabs, self._get_config),
+            self._tab_analyzer, self._tab_optimizer, self._tab_masks,
+            self._tab_polygon, self._tab_keyframes, self._tab_dead_bones,
+            self._tab_hidden, self._tab_unused, self._tab_blend,
+            self._tab_draw_order, self._tab_renamer, self._tab_splitter,
+            self._tab_converter, self._tab_unpacker, self._tab_static,
+            self._tab_flattener, self._tab_merge, self._tab_viewer,
+            self._tab_mcp,
         ]
 
         # Select first tool
@@ -298,6 +445,8 @@ class SpineSwissKnifeApp(QMainWindow):
         self._spine_btn_container.hide()
         self._btn_export_atlas.hide()
         self._btn_save_spine.hide()
+        self._validation_state = None
+        self._render_validation()
 
     def _make_cli_progress(self) -> QProgressDialog:
         """Create a modal progress dialog for Spine CLI operations."""
@@ -323,6 +472,42 @@ class SpineSwissKnifeApp(QMainWindow):
             QApplication.processEvents()
         return _on_output
 
+    def _pick_skeleton(self, jsons, preselect: str = "") -> Optional[str]:
+        """Let the user choose one of several exported skeletons (by file stem).
+
+        Returns the chosen JSON path, or None when cancelled.
+        """
+        if len(jsons) == 1:
+            return jsons[0]
+        stems = [Path(j).stem for j in jsons]
+        current = 0
+        if preselect:
+            for i, j in enumerate(jsons):
+                if _norm_path(j) == _norm_path(preselect):
+                    current = i
+        chosen, ok = QInputDialog.getItem(
+            self, tr("spine_mode.pick_title"), tr("spine_mode.pick_label"),
+            stems, current, False,
+        )
+        if not ok:
+            return None
+        return jsons[stems.index(chosen)]
+
+    def _select_export(self, result, preselect: str = ""):
+        """``(json, atlas)`` of an export result, asking when several skeletons
+        were exported; None when the user cancelled."""
+        jsons = list(result.output_jsons or [])
+        if not jsons and result.output_json:
+            jsons = [result.output_json]
+        if not jsons:
+            return "", result.output_atlas
+        json_path = self._pick_skeleton(jsons, preselect)
+        if json_path is None:
+            return None
+        self._export_jsons = jsons
+        atlas = pair_atlas(json_path, result.output_atlases, result.output_atlas)
+        return json_path, atlas
+
     def _enter_spine_mode(self, spine_path: str, pack: bool = True,
                           version: str = ""):
         """Export .spine project via CLI, fill config paths, switch to tool area."""
@@ -336,18 +521,28 @@ class SpineSwissKnifeApp(QMainWindow):
         export_dir = str(Path(spine_path).parent / f"_ssk_export_{stem}")
 
         progress = self._make_cli_progress()
-        result = export_spine_project(
-            exe, spine_path, export_dir,
-            on_output=self._cli_output_updater(progress),
-            pack=pack,
-        )
-        progress.close()
+        try:
+            result = export_spine_project(
+                exe, spine_path, export_dir,
+                on_output=self._cli_output_updater(progress),
+                pack=pack,
+            )
+        finally:
+            progress.close()
 
         if not result.success:
             error = result.stderr or result.stdout or "Unknown error"
             QMessageBox.warning(self, tr("err.title"),
                                 tr("spine_mode.export_failed", error=error))
             return
+
+        previous_jsons = self._export_jsons
+        self._export_jsons = []
+        picked = self._select_export(result)
+        if picked is None:
+            self._export_jsons = previous_jsons
+            return
+        json_path, atlas_path = picked
 
         self._mode = "spine"
         self._spine_project_path = spine_path
@@ -357,8 +552,8 @@ class SpineSwissKnifeApp(QMainWindow):
 
         # Fill config fields
         self._spine_project_edit.setText(spine_path)
-        self._json_edit.setText(result.output_json)
-        self._atlas_edit.setText(result.output_atlas)
+        self._json_edit.setText(json_path)
+        self._atlas_edit.setText(atlas_path)
 
         # Auto-detect images folder from export dir
         img_dir = Path(export_dir) / "images"
@@ -392,6 +587,7 @@ class SpineSwissKnifeApp(QMainWindow):
         self._mode = "json"
         self._spine_project_path = ""
         self._export_dir = ""
+        self._export_jsons = []
         settings.set_last_mode("json")
 
         # Hide .spine row, make fields editable
@@ -421,6 +617,8 @@ class SpineSwissKnifeApp(QMainWindow):
             self._json_edit.setText(json_path)
             self._auto_fill_from_json(json_path)
             self._run_all_tabs()
+        else:
+            self._update_validation()
 
     def _switch_mode(self):
         """Return to welcome page, clearing current state."""
@@ -450,8 +648,11 @@ class SpineSwissKnifeApp(QMainWindow):
         Shows a dialog letting the user optionally downgrade the JSON to a
         different Spine version before importing.  Creates a timestamped
         backup of the original .spine file, then removes the original so
-        the Spine CLI creates a fresh project with only the imported
-        skeleton (avoids duplicate skeletons).
+        the Spine CLI creates a fresh project (avoids duplicate skeletons).
+
+        When the project had several skeletons, the project is rebuilt from
+        ALL exported skeletons (the edited one included); on any failure the
+        backup is restored.  (Untested against a real Spine.)
         """
         json_path = self._json_edit.text().strip()
         if not json_path or not self._spine_project_path:
@@ -460,15 +661,25 @@ class SpineSwissKnifeApp(QMainWindow):
         spine = Path(self._spine_project_path)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_path = spine.with_name(f"{spine.stem}_backup_{stamp}.spine")
+        plan = import_plan(json_path, self._export_jsons)
+        multi = len(plan) > 1
 
         # --- version picker dialog ---
         dlg = QDialog(self)
         dlg.setWindowTitle(tr("spine_mode.save_as_title"))
         layout = QVBoxLayout(dlg)
 
-        info = QLabel(tr("spine_mode.confirm_import",
-                         spine_file=self._spine_project_path,
-                         backup=str(backup_path)))
+        if multi:
+            text = tr("spine_mode.confirm_import_multi",
+                      count=len(plan),
+                      skeletons=", ".join(Path(j).stem for j in plan),
+                      spine_file=self._spine_project_path,
+                      backup=str(backup_path))
+        else:
+            text = tr("spine_mode.confirm_import",
+                      spine_file=self._spine_project_path,
+                      backup=str(backup_path))
+        info = QLabel(text)
         info.setWordWrap(True)
         layout.addWidget(info)
 
@@ -490,14 +701,39 @@ class SpineSwissKnifeApp(QMainWindow):
 
         target_version = version_combo.currentData()
 
-        # --- optionally downgrade JSON before import ---
+        # --- optionally downgrade the JSON(s) before import ---
+        # Convert in memory first so the user can cancel on warnings before
+        # any file is touched.
+        converted = {}
         if target_version:
+            all_warnings = []
             try:
-                with open(json_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                data, warnings = convert_to_destination(data, target_version)
-                with open(json_path, "w", encoding="utf-8") as f:
-                    json.dump(data, f, separators=(",", ":"))
+                for jp in plan:
+                    data = load_spine_json(jp)
+                    data, warnings = convert_to_destination(data, target_version)
+                    converted[jp] = data
+                    prefix = "[%s] " % Path(jp).stem if multi else ""
+                    all_warnings.extend(prefix + w for w in warnings)
+            except Exception as e:
+                QMessageBox.warning(self, tr("err.title"),
+                                    tr("spine_mode.downgrade_failed", error=str(e)))
+                return
+            if all_warnings:
+                shown = all_warnings[:15]
+                if len(all_warnings) > len(shown):
+                    shown.append("... (+%d more)" % (len(all_warnings) - len(shown)))
+                reply = QMessageBox.question(
+                    self, tr("confirm.title"),
+                    tr("spine_mode.downgrade_warnings", version=target_version,
+                       warnings="\n".join("- " + w for w in shown)),
+                    QMessageBox.Yes | QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    return
+            try:
+                for jp, data in converted.items():
+                    create_backup(jp)
+                    save_spine_json(jp, data)
             except Exception as e:
                 QMessageBox.warning(self, tr("err.title"),
                                     tr("spine_mode.downgrade_failed", error=str(e)))
@@ -514,13 +750,22 @@ class SpineSwissKnifeApp(QMainWindow):
 
         exe = settings.spine_executable()
         progress = self._make_cli_progress()
-        result = import_to_spine_project(
-            exe, json_path, self._spine_project_path,
-            on_output=self._cli_output_updater(progress),
-        )
-        progress.close()
+        failure = ""
+        try:
+            for jp in plan:
+                result = import_to_spine_project(
+                    exe, jp, self._spine_project_path,
+                    on_output=self._cli_output_updater(progress),
+                )
+                if not result.success:
+                    failure = result.stderr or result.stdout or "Unknown error"
+                    break
+        except Exception as e:  # never leave the project deleted
+            failure = str(e)
+        finally:
+            progress.close()
 
-        if result.success:
+        if not failure:
             QMessageBox.information(
                 self, tr("done.title"),
                 tr("spine_mode.import_done",
@@ -528,12 +773,15 @@ class SpineSwissKnifeApp(QMainWindow):
                    backup=str(backup_path)),
             )
         else:
-            # Restore from backup on failure
-            if backup_path.is_file() and not spine.is_file():
-                shutil.copy2(str(backup_path), str(spine))
-            error = result.stderr or result.stdout or "Unknown error"
-            QMessageBox.warning(self, tr("err.title"),
-                                tr("spine_mode.import_failed", error=error))
+            # Restore from backup (also replaces a partially written project)
+            if restore_spine_backup(backup_path, spine):
+                QMessageBox.warning(self, tr("err.title"),
+                                    tr("spine_mode.import_failed", error=failure))
+            else:
+                QMessageBox.warning(
+                    self, tr("err.title"),
+                    tr("spine_mode.import_restore_failed", error=failure,
+                       backup=str(backup_path)))
 
     # ── JSON mode operations ──
 
@@ -695,12 +943,14 @@ class SpineSwissKnifeApp(QMainWindow):
 
         exe = settings.spine_executable()
         progress = self._make_cli_progress()
-        result = export_spine_project(
-            exe, self._spine_project_path, self._export_dir,
-            on_output=self._cli_output_updater(progress),
-            pack=getattr(self, "_spine_pack_atlas", True),
-        )
-        progress.close()
+        try:
+            result = export_spine_project(
+                exe, self._spine_project_path, self._export_dir,
+                on_output=self._cli_output_updater(progress),
+                pack=getattr(self, "_spine_pack_atlas", True),
+            )
+        finally:
+            progress.close()
 
         if not result.success:
             error = result.stderr or result.stdout or "Unknown error"
@@ -708,15 +958,20 @@ class SpineSwissKnifeApp(QMainWindow):
                                 tr("spine_mode.export_failed", error=error))
             return
 
-        self._json_edit.setText(result.output_json)
-        self._atlas_edit.setText(result.output_atlas)
+        previous_jsons = self._export_jsons
+        picked = self._select_export(result, preselect=self._json_edit.text().strip())
+        if picked is None:
+            self._export_jsons = previous_jsons
+            return
+        json_path, atlas_path = picked
+        self._json_edit.setText(json_path)
+        self._atlas_edit.setText(atlas_path)
         self._run_all_tabs()
 
     # ── Language ──
 
     def _retranslate(self):
         self.setWindowTitle(f"GreentubeSK Spine Swiss Knife v{__version__}")
-        self._update_btn.setText(tr("update.btn"))
         self._loading_overlay.setText(tr("app.loading"))
         self._title_label.setText(tr("app.title"))
         self._home_btn.setText(tr("app.home"))
@@ -730,16 +985,22 @@ class SpineSwissKnifeApp(QMainWindow):
         self._images_label.setText(tr("app.images_label"))
         self._images_edit.setPlaceholderText(tr("app.images_placeholder"))
         self._btn_json.setText(tr("app.browse"))
+        self._btn_restore.setText(tr("app.restore_btn"))
         self._btn_export_atlas.setText(tr("json_mode.export_atlas_btn"))
         self._btn_save_spine.setText(tr("json_mode.save_spine_btn"))
         self._btn_atlas.setText(tr("app.browse"))
         self._btn_images.setText(tr("app.browse"))
         for idx, (name_key, tip_key) in enumerate(_SIDEBAR_KEYS):
-            self._sidebar_btns[idx].setText(tr(name_key))
-            self._sidebar_btns[idx].setToolTip(tr(tip_key))
+            if idx < len(self._sidebar_btns):
+                self._sidebar_btns[idx].setText(tr(name_key))
+                self._sidebar_btns[idx].setToolTip(tr(tip_key))
+        self._render_validation()
         for tab in self._tab_instances:
             if hasattr(tab, "_retranslate"):
-                tab._retranslate()
+                try:
+                    tab._retranslate()
+                except Exception:
+                    log_exception("retranslate failed for %s" % type(tab).__name__)
 
     def _switch_tool(self, index: int):
         self._tabs.setCurrentIndex(index)
@@ -794,9 +1055,17 @@ class SpineSwissKnifeApp(QMainWindow):
                     break
         self._atlas_edit.setText(atlas_found)
 
-        # Always re-detect images folder for the new JSON
-        img_dir = parent / "images"
-        self._images_edit.setText(str(img_dir) if img_dir.is_dir() else "")
+        # Always re-detect images folder for the new JSON: the folder named in
+        # skeleton.images (relative to the JSON) wins over ./images
+        images_found = ""
+        try:
+            images_found = resolve_images_dir(json_path, load_spine_json(json_path))
+        except Exception:
+            images_found = ""
+        if not images_found:
+            img_dir = parent / "images"
+            images_found = str(img_dir) if img_dir.is_dir() else ""
+        self._images_edit.setText(images_found)
 
     def _browse_atlas(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -804,16 +1073,21 @@ class SpineSwissKnifeApp(QMainWindow):
         )
         if path:
             self._atlas_edit.setText(path)
+            self._run_all_tabs()
 
     def _browse_images(self):
         path = QFileDialog.getExistingDirectory(self, tr("app.dialog.select_images"))
         if path:
             self._images_edit.setText(path)
+            self._run_all_tabs()
 
     # --- Run all tabs after JSON selection ---
 
     def _run_all_tabs(self):
         """Trigger analyze/load/detect on all tabs so everything is ready."""
+        if self._refreshing:
+            return
+        self._refreshing = True
         overlay = self._loading_overlay
         overlay.resize(self._tab_container.size())
         overlay.show()
@@ -821,37 +1095,160 @@ class SpineSwissKnifeApp(QMainWindow):
         QApplication.processEvents()
         try:
             self._run_all_tabs_inner()
+            self._update_validation()
+        except Exception:
+            log_exception("refresh failed")
         finally:
             overlay.hide()
+            self._refreshing = False
+
+    def _refresh_steps(self):
+        """(name, callable) for every automatic refresh; no step may show a
+        modal dialog for an expected state (silent flag / pre-checks)."""
+        has_atlas = bool(self._atlas_edit.text().strip())
+        has_images = bool(self._images_edit.text().strip())
+        steps = [
+            ("Analyzer", self._tab_analyzer._analyze),
+            ("Rect Masks", self._tab_masks._analyze),
+            ("Polygon", self._tab_polygon._analyze),
+            ("Keyframes", lambda: self._tab_keyframes._analyze(silent=True)),
+            ("Dead Bones", self._tab_dead_bones._analyze),
+            ("Hidden Attachments", self._tab_hidden._analyze),
+            ("Blend Modes", self._tab_blend._analyze),
+            ("Draw Order", self._tab_draw_order._analyze),
+            ("Slot Renamer", self._tab_renamer._analyze),
+            ("Splitter", self._tab_splitter._load),
+            ("Static Exporter", self._tab_static._load),
+        ]
+        if has_images:
+            steps.append(("Unused Finder",
+                          lambda: self._tab_unused._analyze(silent=True)))
+        if has_atlas:
+            steps.append(("Viewer", lambda: self._tab_viewer._load(silent=True)))
+        return steps
 
     def _run_all_tabs_inner(self):
-        tabs = self._tab_instances
-        has_atlas = bool(self._atlas_edit.text().strip())
+        json_path = self._json_edit.text().strip()
+        if not json_path or not os.path.isfile(json_path):
+            return
+        # Pre-check: an unreadable JSON would otherwise raise one error dialog
+        # per tab.  Report it once in the console instead.
+        try:
+            load_spine_json(json_path)
+        except Exception as e:
+            log_error("Cannot read %s: %s" % (json_path, e))
+            return
 
-        # JSON-only tabs: Analyzer, Rect Masks, Polygon, Keyframes, Dead Bones,
-        # Hidden Att., Blend, Draw Order, Slot Renamer
-        for tab in [tabs[0], tabs[2], tabs[3], tabs[4], tabs[5], tabs[6],
-                     tabs[7], tabs[8], tabs[9]]:
+        for name, step in self._refresh_steps():
             try:
-                tab._analyze()
+                step()
             except Exception:
-                pass
-        # Splitter — Load Animations
+                log_exception("%s refresh failed" % name)
+
+    # --- Skeleton validation status line ---
+
+    def _update_validation(self):
+        """Validate the current JSON (and atlas regions) and update the status line."""
+        json_path = self._json_edit.text().strip()
+        if not json_path or not os.path.isfile(json_path):
+            self._validation_state = None
+            self._validation_details = ""
+            self._render_validation()
+            return
         try:
-            tabs[10]._load()
-        except Exception:
-            pass
-        # Static Exporter — reads animation list from JSON
-        try:
-            tabs[13]._load()
-        except Exception:
-            pass
-        # Viewer — needs atlas (last tab)
-        if has_atlas:
+            data = load_spine_json(json_path)
+        except Exception as e:
+            self._validation_state = ("unreadable",)
+            self._validation_details = "Cannot read %s: %s" % (json_path, e)
+            self._render_validation()
+            return
+        regions = None
+        atlas_path = self._atlas_edit.text().strip()
+        if atlas_path and os.path.isfile(atlas_path):
             try:
-                tabs[16]._load()
+                regions = parse_atlas(atlas_path)
             except Exception:
-                pass
+                regions = None
+        try:
+            issues = validate_skeleton(data, regions)
+        except Exception as e:  # validate_skeleton does not raise; be safe anyway
+            issues = [{"severity": "error", "code": "validator_failure",
+                       "where": "skeleton", "message": str(e)}]
+        errors, warnings, details = summarize_issues(issues)
+        self._validation_details = details
+        self._validation_state = ("ok",) if not (errors or warnings) else ("issues", errors, warnings)
+        self._render_validation()
+
+    def _render_validation(self):
+        state = self._validation_state
+        btn = self._validation_btn
+        if state is None:
+            btn.hide()
+            return
+        if state[0] == "ok":
+            text, color = tr("app.validation.ok"), "#6ec072"
+        elif state[0] == "unreadable":
+            text, color = tr("app.validation.unreadable"), "#f38ba8"
+        else:
+            text = tr("app.validation.issues", errors=state[1], warnings=state[2])
+            color = "#f38ba8" if state[1] else "#e8a838"
+        btn.setText(text)
+        btn.setStyleSheet(
+            "text-align: left; padding: 2px 6px; background: transparent;"
+            "border: none; font-weight: bold; color: %s;" % color)
+        btn.show()
+
+    def _show_validation_details(self):
+        if not self._validation_details:
+            return
+        self._debug_console.append_text("Skeleton check:\n" + self._validation_details)
+        self._debug_console.expand()
+
+    # --- Backup history ---
+
+    def _restore_backup_dialog(self):
+        json_path = self._json_edit.text().strip()
+        if not json_path or not Path(json_path).is_file():
+            QMessageBox.warning(self, tr("err.title"), tr("err.no_json"))
+            return
+        backups = list_backups(json_path)
+        if not backups:
+            QMessageBox.information(self, tr("info.title"), tr("app.restore.empty"))
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(tr("app.restore.title"))
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel(tr("app.restore.label", name=Path(json_path).name)))
+        listing = QListWidget()
+        for b in backups:
+            item = QListWidgetItem(describe_backup(b))
+            item.setData(Qt.UserRole, b)
+            listing.addItem(item)
+        listing.setCurrentRow(0)
+        layout.addWidget(listing)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+        if dlg.exec() != QDialog.Accepted or listing.currentItem() is None:
+            return
+        chosen = listing.currentItem().data(Qt.UserRole)
+
+        reply = QMessageBox.question(
+            self, tr("confirm.title"),
+            tr("app.restore.confirm", backup=describe_backup(chosen)),
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            restore_json_backup(json_path, chosen)
+        except Exception as e:
+            QMessageBox.warning(self, tr("err.title"),
+                                tr("app.restore.failed", error=str(e)))
+            return
+        self._run_all_tabs()
 
     # --- Auto-update ---
 

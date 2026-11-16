@@ -1,7 +1,11 @@
 """Draw Order Optimizer — reduce draw calls by grouping blend modes."""
 
+from __future__ import annotations
+
 import copy
+import math
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,13 +23,20 @@ from . import draw_order_core
 from .draw_order_core import (
     DEFAULT_THRESHOLD_PERCENT,
     DEFAULT_TOLERANCE,
+    baseline_is_reorder_of,
+    build_reordered_data,
+    plan_baseline_storage,
     compute_optimal_order,
     count_blend_groups,
     iter_group_reducing_block_moves,
     resolve_baseline_paths,
     threshold_percent_to_ratio,
 )
-from .spine_json import load_spine_json, save_spine_json, normalize_skins
+from .spine_json import (
+    load_spine_json, save_spine_json, normalize_skins,
+    get_draw_order_timeline, create_backup as _create_backup,
+)
+from .atlas_parser import parse_atlas_pages
 from .spine_viewer_animation import (
     BoneTransform, solve_world_transforms, AnimationState,
     _evaluate_draw_order, solve_ik_constraints,
@@ -35,6 +46,7 @@ from .spine_viewer_canvas import SpineGLCanvas
 from .draw_order_renderer import (
     _compute_skeleton_bbox, _render_all_animations, _compare_with_original,
     render_frame, render_animation_sequence, _moved_names,
+    RenderError, render_skin_names, animation_duration, make_spill_dir,
 )
 from .draw_order_compare_dialog import CompareDialog
 
@@ -74,9 +86,8 @@ def compute_slot_visibility(spine_data: dict) -> dict:
                     visible.add(slot_name)
 
         # Slots referenced in drawOrder timelines
-        for entry in anim_data.get("drawOrder",
-                                    anim_data.get("draworder", [])):
-            for offset in entry.get("offsets", []):
+        for entry in get_draw_order_timeline(anim_data):
+            for offset in entry.get("offsets") or []:
                 if "slot" in offset:
                     visible.add(offset["slot"])
 
@@ -111,7 +122,7 @@ def auto_group_animations(spine_data: dict) -> dict[str, list[str]]:
 def has_draw_order_timelines(spine_data: dict) -> bool:
     """Check whether any animation has drawOrder keyframes."""
     for anim in spine_data.get("animations", {}).values():
-        if anim.get("drawOrder"):
+        if isinstance(anim, dict) and get_draw_order_timeline(anim):
             return True
     return False
 
@@ -167,7 +178,8 @@ def _get_clip_regions(
     """Return list of (clip_start_idx, clip_end_idx) pairs.
 
     A clipping attachment on slot *i* with ``end`` naming slot *j*
-    means slots between *i* and *j* are clipped.
+    means slots between *i* and *j* are clipped. Without ``end`` the clip
+    runs to the last slot of the draw order.
     """
     slot_index = {s["name"]: i for i, s in enumerate(slots)}
     regions = []
@@ -177,10 +189,11 @@ def _get_clip_regions(
                 if att_data.get("type") != "clipping":
                     continue
                 end_name = att_data.get("end", "")
-                if not end_name:
-                    continue
                 start_idx = slot_index.get(slot_name)
-                end_idx = slot_index.get(end_name)
+                if not end_name:
+                    end_idx = len(slots) - 1 if slots else None
+                else:
+                    end_idx = slot_index.get(end_name)
                 if start_idx is not None and end_idx is not None:
                     lo, hi = min(start_idx, end_idx), max(start_idx, end_idx)
                     regions.append((lo, hi))
@@ -425,7 +438,7 @@ def optimize_draw_order(spine_data, fps=60, tolerance=5,
                          anim_filter=None):
     """Zone-based draw-order optimisation with QPainter verification.
 
-    1. Render original once (cached).
+    1. Render original once (cached; memory-bounded, may spill to disk).
     2. Compute optimal slot order (zone-aware stable partition).
     3. Render optimized, compare with original.
     4. If mismatch, bisect on moved slots to find safe subset.
@@ -473,11 +486,6 @@ def optimize_draw_order(spine_data, fps=60, tolerance=5,
     log(f"Zones: {len(zones)} "
         f"({sum(1 for z in zones if not z.is_boundary)} optimisable)")
 
-    # Compute bounding box
-    bbox = _compute_skeleton_bbox(baseline_data, textures)
-    bw, bh = int(bbox[2]), int(bbox[3])
-    log(f"Render canvas: {bw}\u00d7{bh}px")
-
     animations = spine_data.get("animations", {})
     if anim_filter is not None:
         anim_names = [None] + [n for n in animations if n in anim_filter]
@@ -487,15 +495,123 @@ def optimize_draw_order(spine_data, fps=60, tolerance=5,
     # -- Slot visibility map for per-move filtering --
     slot_vis = compute_slot_visibility(spine_data)
 
-    # -- Step 1: Render original ONCE (in-memory only) --
-    log("Rendering original...")
-    original_images = _render_all_animations(
-        baseline_data, textures, baseline_slots,
-        anim_names, fps, bbox)
-    total_frames = sum(len(v) for v in original_images.values())
-    log(f"  {total_frames} frames rendered.")
+    # -- Step 1: Render original ONCE (memory-bounded, see prepare_baseline) --
+    try:
+        original_images, bbox, fps = prepare_baseline(
+            baseline_data, textures, anim_names, fps, on_log=on_log)
+    except RenderError as exc:
+        log(f"\u2718 {exc}")
+        return {"success": False, "message": str(exc)}
 
-    # -- Step 2: Test full optimization --
+    try:
+        return _optimize_with_baseline(
+            spine_data, textures, original_images, bbox, fps, anim_names,
+            slot_vis, current_slots, optimized, initial_groups,
+            optimal_groups, tolerance, threshold, on_log, debug_dir)
+    except RenderError as exc:
+        log(f"\u2718 {exc}")
+        return {"success": False, "message": str(exc)}
+    finally:
+        original_images.cleanup()
+
+
+def prepare_baseline(baseline_data, textures, anim_names, fps, on_log=None):
+    """Render the baseline (original) frames of *anim_names* (None = setup).
+
+    Chooses a sampling rate / storage that keeps memory bounded
+    (``plan_baseline_storage``). Returns ``(frames, bbox, effective_fps)``;
+    the caller must call ``frames.cleanup()``. Raises :class:`RenderError`
+    when nothing visible is rendered.
+    """
+    def log(msg):
+        if on_log:
+            on_log(msg)
+
+    bbox = _compute_skeleton_bbox(baseline_data, textures, on_log=on_log)
+    bw, bh = int(math.ceil(bbox[2])), int(math.ceil(bbox[3]))
+    skins = render_skin_names(baseline_data)
+    log(f"Render canvas: {bw}\u00d7{bh}px, skins: {', '.join(skins)}")
+
+    durations = [animation_duration(baseline_data, n)
+                 for n in anim_names if n is not None]
+    eff_fps, mode, est = plan_baseline_storage(durations, len(skins), bw, bh, fps)
+    mb = est / (1024 * 1024)
+    if eff_fps != fps:
+        log(f"Sampling lowered {fps} \u2192 {eff_fps} fps to bound memory "
+            f"(~{mb:.0f} MB of baseline frames).")
+    if mode == "disk":
+        log(f"Baseline frames (~{mb:.0f} MB) exceed the memory budget; "
+            "spilling them to a temporary directory.")
+    else:
+        log(f"Baseline frames: ~{mb:.0f} MB in memory at {eff_fps} fps.")
+
+    spill = make_spill_dir() if mode == "disk" else None
+    log("Rendering original...")
+    try:
+        frames = _render_all_animations(
+            baseline_data, textures, baseline_data.get("slots", []),
+            anim_names, eff_fps, bbox, spill_dir=spill, on_log=on_log)
+    except BaseException:
+        if spill:
+            shutil.rmtree(spill, ignore_errors=True)
+        raise
+    total_frames = sum(len(v) for v in frames.values())
+    log(f"  {total_frames} frames rendered.")
+    if not frames.any_content:
+        frames.cleanup()
+        raise RenderError(
+            "Nothing rendered \u2014 all baseline frames are fully "
+            "transparent, so the draw order cannot be verified. "
+            "Check the atlas and images.")
+    return frames, bbox, eff_fps
+
+
+def verify_against_baseline(baseline_data, candidate_data, textures, fps=60,
+                            tolerance=5, threshold=0.02, on_log=None,
+                            anim_names=None):
+    """Render *baseline_data* and verify *candidate_data* against it.
+
+    Checks the setup pose and ALL animations (or *anim_names*) for every
+    skin. Returns ``(ok, failed_labels)``; raises :class:`RenderError`.
+    """
+    if anim_names is None:
+        anim_names = [None] + list(
+            (baseline_data.get("animations") or {}).keys())
+    frames, bbox, eff_fps = prepare_baseline(
+        baseline_data, textures, anim_names, fps, on_log=on_log)
+    try:
+        return _compare_with_original(
+            candidate_data, textures, frames, candidate_data.get("slots", []),
+            anim_names, eff_fps, bbox, tolerance, threshold,
+            on_log=on_log, early_exit=False)
+    finally:
+        frames.cleanup()
+
+
+def find_missing_atlas_pages(atlas_path: str) -> list:
+    """Atlas page image names that are missing or fail to load."""
+    atlas_dir = os.path.dirname(atlas_path)
+    missing = []
+    for page in parse_atlas_pages(atlas_path):
+        name = page["name"]
+        path = os.path.join(atlas_dir, name)
+        if not os.path.isfile(path):
+            path = os.path.join(atlas_dir, os.path.basename(name))
+        if not os.path.isfile(path) or QImage(path).isNull():
+            missing.append(name)
+    return missing
+
+
+def _optimize_with_baseline(
+    spine_data, textures, original_images, bbox, fps, anim_names, slot_vis,
+    current_slots, optimized, initial_groups, optimal_groups, tolerance,
+    threshold, on_log, debug_dir,
+):
+    def log(msg):
+        if on_log:
+            on_log(msg)
+
+    # -- Step 2: Test full optimisation --
     log("Testing full optimisation...")
     moved = set(_moved_names(current_slots, optimized))
     ok, diffs = _compare_with_original(
@@ -507,8 +623,7 @@ def optimize_draw_order(spine_data, fps=60, tolerance=5,
     if ok:
         log(f"\u2714 Full optimisation safe! "
             f"{initial_groups} \u2192 {optimal_groups}")
-        test_data = copy.deepcopy(spine_data)
-        test_data["slots"] = optimized
+        test_data = build_reordered_data(spine_data, optimized, deep=True)
         return {"success": True, "modified_data": test_data,
                 "original_groups": initial_groups,
                 "optimized_groups": optimal_groups,
@@ -562,8 +677,7 @@ def optimize_draw_order(spine_data, fps=60, tolerance=5,
     log(f"Done! {initial_groups} \u2192 {final_groups} "
         f"({total_saved} groups saved)")
 
-    test_data = copy.deepcopy(spine_data)
-    test_data["slots"] = working_slots
+    test_data = build_reordered_data(spine_data, working_slots, deep=True)
     return {"success": True, "modified_data": test_data,
             "original_groups": initial_groups,
             "optimized_groups": final_groups,
@@ -685,6 +799,9 @@ class DrawOrderOptimizerTab:
         self._get_config = get_config
         self._on_modified = on_modified
         self._tabs = tabs
+        self._busy = False
+        self._can_optimize = False
+        self._pending_refresh = False
 
         self._page = QWidget()
         tabs.addTab(self._page, tr("draw_order.tab"))
@@ -796,6 +913,8 @@ class DrawOrderOptimizerTab:
         QApplication.processEvents()
 
     def _analyze(self):
+        if self._busy:
+            return
         json_path = self._get_config("json")
         if not json_path or not os.path.isfile(json_path):
             return
@@ -835,15 +954,148 @@ class DrawOrderOptimizerTab:
             self._log_line(tr("draw_order.warn_timelines"), "#e8a838")
 
         can = analysis["can_optimize"]
+        self._can_optimize = can
         self._optimize_btn.setEnabled(can)
         self._presplit_btn.setEnabled(can)
 
+    # -- helpers ------------------------------------------------------
+
+    def _set_buttons_enabled(self, enabled: bool):
+        enabled = bool(enabled and self._can_optimize)
+        self._optimize_btn.setEnabled(enabled)
+        self._presplit_btn.setEnabled(enabled)
+
+    def _run_guarded(self, func):
+        """Run *func* with both action buttons disabled; ignore re-entry."""
+        if self._busy:
+            return
+        self._busy = True
+        self._pending_refresh = False
+        self._set_buttons_enabled(False)
+        try:
+            func()
+        finally:
+            self._busy = False
+            self._set_buttons_enabled(True)
+        if self._pending_refresh:
+            self._pending_refresh = False
+            if self._on_modified:
+                self._on_modified()
+            else:
+                self._analyze()
+
+    @staticmethod
+    def _file_signature(path: str):
+        try:
+            st = os.stat(path)
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    def _resolve_baseline(self, json_path, spine_data):
+        """(baseline_data, baseline_path, backup_path).
+
+        The ``.backup`` is the baseline only if the current JSON is a pure
+        slot reorder of it; otherwise the current JSON is the baseline.
+        """
+        backup_path = json_path + ".backup"
+        backup_data = None
+        if os.path.isfile(backup_path):
+            try:
+                backup_data = load_spine_json(backup_path)
+            except Exception:
+                backup_data = None
+        is_reorder = (backup_data is not None
+                      and baseline_is_reorder_of(spine_data, backup_data))
+        baseline_path, backup_path, _create = resolve_baseline_paths(
+            json_path, backup_exists=backup_data is not None,
+            backup_is_reorder=is_reorder)
+        if baseline_path == json_path:
+            return spine_data, json_path, backup_path
+        return backup_data, baseline_path, backup_path
+
+    def _load_textures(self):
+        """Textures of the configured atlas, or None after logging why not."""
+        atlas_path = self._get_config("atlas")
+        if not atlas_path or not os.path.isfile(atlas_path):
+            self._log_line("No atlas configured \u2014 the draw order cannot "
+                           "be verified, nothing was changed.", "#ff6666")
+            QMessageBox.critical(None, tr("err.title"),
+                                 tr("draw_order.err.no_atlas"))
+            return None
+        try:
+            missing = find_missing_atlas_pages(atlas_path)
+        except Exception as e:
+            self._log_line(f"Atlas could not be read: {e}", "#ff6666")
+            QMessageBox.critical(None, tr("err.title"),
+                                 tr("err.parse_json", error=e))
+            return None
+        if missing:
+            files = ", ".join(missing)
+            self._log_line(f"Atlas page image(s) missing or unreadable: {files}",
+                           "#ff6666")
+            QMessageBox.critical(None, tr("err.title"),
+                                 tr("draw_order.err.missing_pages", files=files))
+            return None
+        try:
+            textures = load_atlas_textures(atlas_path)
+        except Exception as e:
+            self._log_line(f"Atlas could not be loaded: {e}", "#ff6666")
+            QMessageBox.critical(None, tr("err.title"),
+                                 tr("draw_order.err.no_atlas"))
+            return None
+        if not textures:
+            self._log_line("Atlas contains no textures \u2014 cannot verify.",
+                           "#ff6666")
+            QMessageBox.critical(None, tr("err.title"),
+                                 tr("draw_order.err.no_atlas"))
+            return None
+        self._log_line(f"Loaded {len(textures)} textures.", "#6ec072")
+        return textures
+
+    def _debug_dir(self, json_path):
+        if not self._debug_cb.isChecked():
+            return None
+        debug_dir = os.path.join(os.path.dirname(json_path),
+                                 "_ssk_draw_order_debug")
+        if Path(debug_dir).exists():
+            shutil.rmtree(debug_dir, ignore_errors=True)
+        self._log_line(f"Debug PNGs will be saved to: {debug_dir}", "#e8a838")
+        return debug_dir
+
+    def _log_fn(self):
+        return lambda msg: (self._log_line(msg, "#6ec072"),
+                            QApplication.processEvents())
+
+    def _save_result(self, json_path, loaded_sig, data) -> bool:
+        """Back up and save; refuse when the JSON changed since loading."""
+        if self._file_signature(json_path) != loaded_sig:
+            QMessageBox.critical(None, tr("err.title"),
+                                 tr("draw_order.err.json_changed"))
+            self._log_line("JSON changed during the run \u2014 nothing saved.",
+                           "#ff6666")
+            return False
+        try:
+            _create_backup(json_path)
+            save_spine_json(json_path, data)
+        except Exception as e:
+            QMessageBox.critical(None, tr("err.title"),
+                                 tr("err.save_json", error=e))
+            return False
+        return True
+
+    # -- single run -----------------------------------------------------
+
     def _optimize(self):
+        self._run_guarded(self._optimize_impl)
+
+    def _optimize_impl(self):
         json_path = self._get_config("json")
         if not json_path or not os.path.isfile(json_path):
             QMessageBox.critical(None, tr("err.title"), tr("err.no_json"))
             return
 
+        loaded_sig = self._file_signature(json_path)
         try:
             spine_data = load_spine_json(json_path)
         except Exception as e:
@@ -851,17 +1103,8 @@ class DrawOrderOptimizerTab:
                                  tr("err.parse_json", error=e))
             return
 
-        backup_exists = os.path.isfile(json_path + ".backup")
-        baseline_path, backup_path, create_backup = resolve_baseline_paths(
-            json_path, backup_exists=backup_exists)
-        baseline_data = spine_data
-        if baseline_path != json_path:
-            try:
-                baseline_data = load_spine_json(baseline_path)
-            except Exception as e:
-                QMessageBox.critical(None, tr("err.title"),
-                                     tr("err.parse_json", error=e))
-                return
+        baseline_data, baseline_path, backup_path = self._resolve_baseline(
+            json_path, spine_data)
 
         analysis = analyze_draw_order(spine_data)
         if not analysis["can_optimize"]:
@@ -878,47 +1121,21 @@ class DrawOrderOptimizerTab:
         fps = 60
         tolerance = self._tolerance_spin.value()
 
-        # Load textures
-        atlas_path = self._get_config("atlas")
-        textures = None
-        if atlas_path and os.path.isfile(atlas_path):
-            try:
-                textures = load_atlas_textures(atlas_path)
-                self._log_line(f"Loaded {len(textures)} textures.", "#6ec072")
-            except Exception:
-                pass
-        if not textures:
-            self._log_line("No atlas \u2014 optimising without visual check.", "#e8a838")
-        elif HAS_NUMPY:
-            self._log_line(
-                "Verifier: QPainter render + tolerant numpy diff.",
-                "#6ec072",
-            )
-        else:
-            self._log_line(
-                "Verifier: QPainter fallback (exact pixel compare).",
-                "#e8a838",
-            )
+        textures = self._load_textures()
+        if textures is None:
+            return
+        self._log_line(
+            "Verifier: QPainter render + tolerant numpy diff."
+            if HAS_NUMPY else
+            "Verifier: QPainter fallback (exact pixel compare).",
+            "#6ec072" if HAS_NUMPY else "#e8a838")
         if baseline_path != json_path:
             self._log_line(
                 f"Baseline locked to original backup: {baseline_path}",
                 "#e8a838",
             )
 
-        # Debug dir for saving comparison PNGs
-        debug_dir = None
-        if self._debug_cb.isChecked():
-            project_dir = os.path.dirname(json_path)
-            debug_dir = os.path.join(project_dir,
-                                     "_ssk_draw_order_debug")
-            if Path(debug_dir).exists():
-                import shutil
-                shutil.rmtree(debug_dir)
-            self._log_line(
-                f"Debug PNGs will be saved to: {debug_dir}",
-                "#e8a838")
-
-        self._optimize_btn.setEnabled(False)
+        debug_dir = self._debug_dir(json_path)
         QApplication.processEvents()
 
         try:
@@ -931,16 +1148,12 @@ class DrawOrderOptimizerTab:
                 textures=textures,
                 debug_dir=debug_dir,
                 baseline_data=baseline_data,
-                on_log=lambda msg: (
-                    self._log_line(msg, "#6ec072"),
-                    QApplication.processEvents(),
-                ),
+                on_log=self._log_fn(),
             )
         except Exception as e:
             self._log_line(f"Error: {e}", "#ff6666")
             import traceback
             self._log_line(traceback.format_exc(), "#ff6666")
-            self._optimize_btn.setEnabled(True)
             return
 
         if result["success"] and "modified_data" in result:
@@ -949,57 +1162,23 @@ class DrawOrderOptimizerTab:
             final_groups = result["optimized_groups"]
 
             if final_groups < orig_groups:
-                # Show comparison dialog if textures are available
-                if textures:
-                    dialog = CompareDialog(
-                        spine_data, modified, textures, parent=None)
-                    accepted = dialog.exec() == QDialog.Accepted
-                else:
-                    # No textures — fall back to confirmation message box
-                    accepted = QMessageBox.question(
-                        None, "Apply Optimization?",
-                        f"Reduced {orig_groups} \u2192 {final_groups} groups.\n"
-                        "No atlas loaded for visual comparison.\n\n"
-                        "Apply the optimized draw order?",
-                    ) == QMessageBox.Yes
+                dialog = CompareDialog(
+                    spine_data, modified, textures, parent=None)
+                accepted = dialog.exec() == QDialog.Accepted
 
                 if accepted:
-                    # Save with backup
-                    import shutil
-                    try:
-                        if create_backup:
-                            shutil.copy2(json_path, backup_path)
-                        save_spine_json(json_path, modified)
-                    except Exception as e:
-                        QMessageBox.critical(None, tr("err.title"),
-                                             tr("err.save_json", error=e))
-                        self._optimize_btn.setEnabled(True)
+                    if not self._save_result(json_path, loaded_sig, modified):
                         return
 
-                    self._log_line(
-                        tr("draw_order.done",
-                           orig=orig_groups,
-                           final=final_groups,
-                           moved=len(result.get("moved_slots", [])),
-                           skipped=len(result.get("unmovable_slots", [])),
-                           backup=backup_path),
-                        "#6ec072",
-                    )
-
-                    QMessageBox.information(
-                        None, tr("done.title"),
-                        tr("draw_order.done",
-                           orig=orig_groups,
-                           final=final_groups,
-                           moved=len(result.get("moved_slots", [])),
-                           skipped=len(result.get("unmovable_slots", [])),
-                           backup=backup_path),
-                    )
-
-                    if self._on_modified:
-                        self._on_modified()
-                    else:
-                        self._analyze()
+                    done_text = tr("draw_order.done",
+                                   orig=orig_groups,
+                                   final=final_groups,
+                                   moved=len(result.get("moved_slots", [])),
+                                   skipped=len(result.get("unmovable_slots", [])),
+                                   backup=backup_path)
+                    self._log_line(done_text, "#6ec072")
+                    QMessageBox.information(None, tr("done.title"), done_text)
+                    self._pending_refresh = True
                 else:
                     self._log_line("Discarded optimization.", "#e8a838")
             else:
@@ -1009,20 +1188,25 @@ class DrawOrderOptimizerTab:
                 result.get("message", "Optimisation failed"), "#ff6666",
             )
 
-        self._optimize_btn.setEnabled(True)
+    # -- pre-split run ----------------------------------------------------
 
     def _presplit_optimize(self):
+        self._run_guarded(self._presplit_impl)
+
+    def _presplit_impl(self):
         """Run draw-order optimisation per animation group (pre-split mode).
 
         Opens a dialog where the user assigns animations to groups.
-        Each group is optimised independently (fewer constraints = more
-        freedom), then the results are chained into a single slot order.
+        Each group is optimised against the ORIGINAL data for its own
+        animations, then the chained result is verified once against the
+        original for ALL animations before anything is saved.
         """
         json_path = self._get_config("json")
         if not json_path or not os.path.isfile(json_path):
             QMessageBox.critical(None, tr("err.title"), tr("err.no_json"))
             return
 
+        loaded_sig = self._file_signature(json_path)
         try:
             spine_data = load_spine_json(json_path)
         except Exception as e:
@@ -1062,41 +1246,24 @@ class DrawOrderOptimizerTab:
         tolerance = self._tolerance_spin.value()
         threshold = threshold_percent_to_ratio(self._threshold_spin.value())
 
-        # Load textures
-        atlas_path = self._get_config("atlas")
-        textures = None
-        if atlas_path and os.path.isfile(atlas_path):
-            try:
-                textures = load_atlas_textures(atlas_path)
-                self._log_line(f"Loaded {len(textures)} textures.", "#6ec072")
-            except Exception:
-                pass
-        if not textures:
-            self._log_line("No atlas — optimising without visual check.",
-                           "#e8a838")
+        textures = self._load_textures()
+        if textures is None:
+            return
 
-        # Resolve baseline for backup
-        backup_exists = os.path.isfile(json_path + ".backup")
-        baseline_path, backup_path, create_backup = resolve_baseline_paths(
-            json_path, backup_exists=backup_exists)
+        baseline_data, baseline_path, backup_path = self._resolve_baseline(
+            json_path, spine_data)
+        if baseline_path != json_path:
+            self._log_line(
+                f"Baseline locked to original backup: {baseline_path}",
+                "#e8a838")
 
-        # Debug dir
-        debug_dir = None
-        if self._debug_cb.isChecked():
-            project_dir = os.path.dirname(json_path)
-            debug_dir = os.path.join(project_dir,
-                                     "_ssk_draw_order_debug")
-            if Path(debug_dir).exists():
-                import shutil
-                shutil.rmtree(debug_dir)
-
-        self._optimize_btn.setEnabled(False)
-        self._presplit_btn.setEnabled(False)
+        debug_dir = self._debug_dir(json_path)
         QApplication.processEvents()
 
         initial_groups_count = count_blend_groups(
             spine_data.get("slots", []))
         current_data = spine_data
+        log_fn = self._log_fn()
 
         try:
             for group_name, group_anims in groups.items():
@@ -1111,13 +1278,10 @@ class DrawOrderOptimizerTab:
                     tolerance=tolerance,
                     threshold=threshold,
                     textures=textures,
-                    baseline_data=current_data,
+                    baseline_data=baseline_data,
                     anim_filter=set(group_anims),
                     debug_dir=debug_dir,
-                    on_log=lambda msg: (
-                        self._log_line(msg, "#6ec072"),
-                        QApplication.processEvents(),
-                    ),
+                    on_log=log_fn,
                 )
 
                 if result["success"] and "modified_data" in result:
@@ -1133,78 +1297,58 @@ class DrawOrderOptimizerTab:
                         f"  Group '{group_name}': "
                         f"{result.get('message', 'no improvement')}",
                         "#e8a838")
+
+            final_groups_count = count_blend_groups(
+                current_data.get("slots", []))
+            self._log_line(
+                tr("draw_order.presplit.log.final",
+                   initial=initial_groups_count,
+                   final=final_groups_count),
+                "#a6e3a1")
+
+            if final_groups_count >= initial_groups_count:
+                self._log_line("No improvement achieved.", "#e8a838")
+                return
+
+            # Final check of the combined order against the original for
+            # ALL animations (including those not assigned to a group).
+            self._log_line("Verifying the combined order against the "
+                           "original for all animations...", "#89b4fa")
+            ok, failed = verify_against_baseline(
+                baseline_data, current_data, textures, fps=fps,
+                tolerance=tolerance, threshold=threshold, on_log=log_fn)
         except Exception as e:
             self._log_line(f"Error: {e}", "#ff6666")
             import traceback
             self._log_line(traceback.format_exc(), "#ff6666")
-            self._optimize_btn.setEnabled(True)
-            self._presplit_btn.setEnabled(True)
             return
 
-        final_groups_count = count_blend_groups(
+        if not ok:
+            names = ", ".join(failed)
+            self._log_line(f"\u2718 Final verification failed for: {names}. "
+                           "Nothing saved.", "#ff6666")
+            QMessageBox.warning(
+                None, tr("err.title"),
+                tr("draw_order.err.final_failed", anims=names))
+            return
+
+        comp = CompareDialog(spine_data, current_data, textures)
+        if comp.exec() != QDialog.Accepted:
+            self._log_line("Discarded optimization.", "#e8a838")
+            return
+
+        if not self._save_result(json_path, loaded_sig, current_data):
+            return
+
+        moved = _moved_names(
+            spine_data.get("slots", []),
             current_data.get("slots", []))
-
-        self._log_line(
-            tr("draw_order.presplit.log.final",
-               initial=initial_groups_count,
-               final=final_groups_count),
-            "#a6e3a1")
-
-        if final_groups_count < initial_groups_count:
-            # Show comparison dialog
-            if textures:
-                comp = CompareDialog(spine_data, current_data, textures)
-                accepted = comp.exec() == QDialog.Accepted
-            else:
-                accepted = QMessageBox.question(
-                    None, "Apply Optimization?",
-                    f"Reduced {initial_groups_count} \u2192 "
-                    f"{final_groups_count} groups.\n\n"
-                    "Apply the optimized draw order?",
-                ) == QMessageBox.Yes
-
-            if accepted:
-                import shutil
-                try:
-                    if create_backup:
-                        shutil.copy2(json_path, backup_path)
-                    save_spine_json(json_path, current_data)
-                except Exception as e:
-                    QMessageBox.critical(None, tr("err.title"),
-                                         tr("err.save_json", error=e))
-                    self._optimize_btn.setEnabled(True)
-                    self._presplit_btn.setEnabled(True)
-                    return
-
-                moved = _moved_names(
-                    spine_data.get("slots", []),
-                    current_data.get("slots", []))
-                self._log_line(
-                    tr("draw_order.done",
+        done_text = tr("draw_order.done",
                        orig=initial_groups_count,
                        final=final_groups_count,
                        moved=len(moved),
                        skipped=0,
-                       backup=backup_path),
-                    "#6ec072")
-
-                QMessageBox.information(
-                    None, tr("done.title"),
-                    tr("draw_order.done",
-                       orig=initial_groups_count,
-                       final=final_groups_count,
-                       moved=len(moved),
-                       skipped=0,
-                       backup=backup_path))
-
-                if self._on_modified:
-                    self._on_modified()
-                else:
-                    self._analyze()
-            else:
-                self._log_line("Discarded optimization.", "#e8a838")
-        else:
-            self._log_line("No improvement achieved.", "#e8a838")
-
-        self._optimize_btn.setEnabled(True)
-        self._presplit_btn.setEnabled(True)
+                       backup=backup_path)
+        self._log_line(done_text, "#6ec072")
+        QMessageBox.information(None, tr("done.title"), done_text)
+        self._pending_refresh = True

@@ -52,29 +52,51 @@ DEFAULT_EXPORT_SETTINGS: dict = {
 # ---------------------------------------------------------------------------
 
 def _vertical_motion_blur(img: "Image.Image", radius: int) -> "Image.Image":
-    """Apply vertical motion blur (90 degrees) using Pillow only.
+    """Apply vertical motion blur (box filter of height 2*radius+1).
 
-    Uses progressive blending of vertically-shifted copies to produce
-    a uniform box blur in the vertical direction.
+    Blurs in premultiplied-alpha space (transparent pixels must not darken
+    the edges) and rounds to 8 bit once.  Uses numpy when available, else
+    Pillow's ``RGBa`` mode.
     """
     if radius <= 0:
         return img.copy()
 
+    img = img.convert("RGBA")
+    try:
+        import numpy as np
+    except ImportError:
+        np = None
+
+    if np is not None:
+        arr = np.asarray(img, dtype=np.float64)
+        h, w = arr.shape[:2]
+        alpha = arr[..., 3:4] / 255.0
+        pre = np.concatenate([arr[..., :3] * alpha, arr[..., 3:4]], axis=2)
+        k = 2 * radius + 1
+        padded = np.zeros((h + 2 * radius, w, 4), dtype=np.float64)
+        padded[radius:radius + h] = pre
+        csum = np.concatenate(
+            [np.zeros((1, w, 4)), np.cumsum(padded, axis=0)], axis=0)
+        box = (csum[k:k + h] - csum[:h]) / k
+        a = box[..., 3:4]
+        rgb = np.where(a > 0, box[..., :3] / np.maximum(a, 1e-12) * 255.0, 0.0)
+        out = np.concatenate([rgb, a], axis=2)
+        out = np.clip(np.rint(out), 0, 255).astype(np.uint8)
+        return Image.fromarray(out, "RGBA")
+
+    # Pillow fallback: premultiplied "RGBa" mode, averaged via repeated blend.
     w, h = img.size
+    pre = img.convert("RGBa")
     acc = None
     for i, dy in enumerate(range(-radius, radius + 1)):
-        shifted = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        shifted = Image.new("RGBa", (w, h), (0, 0, 0, 0))
         src_y1 = max(0, -dy)
         src_y2 = min(h, h - dy)
         dst_y1 = max(0, dy)
         if src_y2 > src_y1:
-            strip = img.crop((0, src_y1, w, src_y2))
-            shifted.paste(strip, (0, dst_y1))
-        if acc is None:
-            acc = shifted
-        else:
-            acc = Image.blend(acc, shifted, 1.0 / (i + 1))
-    return acc
+            shifted.paste(pre.crop((0, src_y1, w, src_y2)), (0, dst_y1))
+        acc = shifted if acc is None else Image.blend(acc, shifted, 1.0 / (i + 1))
+    return acc.convert("RGBA")
 
 
 def _normalize_canvas(

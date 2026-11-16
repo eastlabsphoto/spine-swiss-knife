@@ -13,119 +13,137 @@
 
 ## Tools
 
+The sidebar offers these tools (in this order). Every tool that changes a JSON writes a backup first.
+
 | Tool | Description |
 |------|-------------|
-| **Project Analyzer** | Overview of skeleton structure — bones, slots, skins, animations, attachments |
-| **Image Downscaler** | Batch-resize spine images and update JSON references (width/height) |
-| **Rect Mask Optimizer** | Detect clipping masks that can be snapped to bounding boxes and fix them |
-| **Polygon Simplifier** | Reduce vertex count on polygon clipping masks with per-mask tolerance |
-| **Keyframe Optimizer** | Find and remove redundant animation keyframes (linear interpolation) |
-| **Dead Bones** | Detect bones not referenced by any slot, constraint or animation — remove them |
-| **Hidden Attachments** | Find slots with alpha=0 that still have active attachments wasting GPU — fix setup pose |
-| **Unused Images** | Compare images on disk vs. referenced in JSON/atlas — move unused to `_UNUSED` |
-| **Animation Splitter** | Split a multi-animation skeleton into separate JSON files by group |
-| **Spine Downgrader** | Downgrade Spine 4.x JSON to 3.8 format |
-| **Texture Unpacker** | Extract individual sprites from atlas sheets (`.atlas` or JSON atlas) |
-| **Skeleton Viewer** | Preview skeleton with skin/animation selection, playback controls, bone overlay |
+| **Project Analyzer** | Overview of the skeleton: bones, slots, skins, animations, attachments |
+| **Image Downscaler** | Batch-resize images and update the JSON (width/height, scale). Processed source images are moved to `<images>/_ORIGINALS/` (never deleted) |
+| **Rect Masks** | Snap near-rectangular clipping masks to exact rectangles |
+| **Polygon Simplifier** | Reduce the vertex count of polygon clipping masks with a per-mask tolerance |
+| **Keyframe Optimizer** | Find and remove redundant keyframes (value stays within a tolerance of the interpolation) |
+| **Dead Bones** | Find bones used by no slot, constraint, animation, skin or mesh weight and remove them (weighted meshes are remapped) |
+| **Hidden Attachments** | Find slots with active attachments that are never visible (alpha 0 / zero-scale bone) and clear them in the setup pose |
+| **Blend Switcher** | Detect and fix problematic blend modes |
+| **Draw Order Optimizer** | Reorder slots to reduce draw calls; verifies all skins and needs an atlas |
+| **Slot Renamer** | Add a blend-mode suffix to slot names (all references are updated) |
+| **Animation Splitter** | Split a multi-animation skeleton into separate JSON files by group; optional "include static visible slots" |
+| **Version Converter** | Convert between Spine versions (3.x / 4.x); downgrades are lossy and list their warnings |
+| **Texture Unpacker** | Extract individual sprites from an atlas |
+| **Static Image Exporter** | Export frame 0 of an animation as PNG (trim / center / fixed canvas) with optional blur variant (needs Spine) |
+| **Image Flattener** | Move images from sub-folders into the images root and update the JSON |
+| **Merge Skeletons** | Merge several skeletons (bones, slots, skins, animations, atlas pages) into one |
+| **Skeleton Viewer** | Built-in preview with skin/animation selection, playback and bone overlay |
+| **Unused Images** | Compare images on disk with the atlas and/or the JSON references and move unused ones to `_UNUSED` |
+| **Claude / MCP** | Shows the setup snippet for connecting Claude to the headless tools (see below) |
 
 ## Requirements
 
 - Python 3.10+
-- PySide6
-- Pillow
-
-```bash
-pip install PySide6 Pillow
-```
+- PySide6, Pillow, numpy, certifi (`pip install -r requirements.txt`)
+- Spine installed for the features that call the Spine command line (`.spine` projects, export, static images). JSON-only work needs no Spine.
 
 ## Usage
 
 ```bash
-# Run as module
-python -m spine_swiss_knife
-
-# Or via launcher script
-python spine_swiss_knife.py
+python -m spine_swiss_knife      # or: python spine_swiss_knife.py
 ```
 
-1. Set **Spine JSON**, **Atlas** and **Images** paths in the top config panel
-2. All tabs auto-analyze on load
-3. Use each tool's action button (Fix / Apply / Remove) — a `.backup` file is always created before changes
-4. Changes propagate across tabs automatically (fresh JSON is reloaded after every action)
+Two ways to start:
 
-## Headless API / CLI / MCP (for AI agents and scripts)
+- **`.spine` project mode**: pick a project; the tool exports it with the Spine CLI, you optimize the exported JSON/atlas/images, and the result can be imported back. A project with several skeletons shows a skeleton picker; the multi-skeleton import-back is rebuilt from the exports.
+- **JSON mode**: pick a skeleton JSON (plus atlas and images folder) directly.
 
-No GUI needed; Spine must be installed (licence used by the Spine CLI).
-Pillow is required for `export_static`.
+Set the paths in the config panel on top; tabs analyze on load and reload after every change.
+
+### Backups and validation
+
+- Before every modification the tool writes `<file>.json.backup` (state before the last change) and a timestamped copy in `_ssk_backups/` next to the file (the last 20 are kept).
+- The **Restore backup...** button brings back the `.backup` or any history entry.
+- A validator status line shows structural problems of the current JSON (broken bone/slot references, bad draw-order offsets, missing atlas regions, ...).
+
+## Headless API / CLI / MCP
+
+No GUI needed (PySide6 is not imported). Tools marked "Spine" need the Spine executable; the JSON tools do not. Everything that writes is a dry-run unless `apply` is set, writes a backup first, and validates the result (if applying would introduce validation errors the file is restored and an error is returned).
 
 | Tool | What it does |
 |------|--------------|
-| `project_info` | Skeletons, animations, skins, bone/slot counts of a `.spine` |
-| `export_json` | Export every skeleton to compact JSON + packed atlas (Mynt settings) |
-| `check_regions` | Verify every region/mesh attachment exists in the atlas (catches `Region not found in atlas`) |
-| `fix_attachment_name` | Rename an attachment string in an exported JSON (dry-run unless `apply`) |
-| `export_static` | Frame 0 of an animation as PNG (`trim` / `center` / `fixed` canvas, origin-aligned) + optional vertical blur |
+| `project_info` | Skeletons, animations, skins, bone/slot counts of a `.spine` (Spine) |
+| `export_json` | Export every skeleton to compact JSON + packed atlas (Spine) |
+| `check_regions` | Verify every region/mesh attachment exists in the atlas |
+| `fix_attachment_name` | Rename an attachment in an exported JSON |
+| `export_static` | Frame 0 of an animation as PNG, optional blur (Spine, Pillow) |
+| `validate` | Structural validation of a JSON (optionally against an atlas) |
+| `optimize_keyframes` | Remove redundant keyframes (`tolerance`, default 0.1) |
+| `remove_dead_bones` | Remove unused bones |
+| `fix_hidden_attachments` | Clear never-visible setup attachments |
+| `snap_rect_masks` | Snap near-rectangular clipping masks (`tolerance`, default 10) |
+| `unused_images` | Report images on disk not referenced by JSON/atlas (read-only) |
+| `report` | Read-only overview: counts, validation, and what each optimizer would save |
+| `batch` | Run one JSON tool on every skeleton JSON in a folder (`tool`, `recursive`, `apply`) |
 
 ```bash
 # CLI (prints JSON)
-python -m spine_swiss_knife.cli check-regions --json-path joker.json --atlas-path joker.atlas
-python -m spine_swiss_knife.cli export-static --spine-file joker.spine --skeleton joker --animation idle --mode center --blur-radius 6 --out-dir out
+python -m spine_swiss_knife.cli report --json-path joker.json
+python -m spine_swiss_knife.cli optimize-keyframes --json-path joker.json --tolerance 0.1 --apply
+python -m spine_swiss_knife.cli batch --folder exports --tool remove_dead_bones
 
-# MCP server (stdio, no extra dependencies, works on Python 3.9+)
+# MCP server (stdio, no extra dependencies, Python 3.9+)
 claude mcp add spine-swiss-knife -- python3 -m spine_swiss_knife.mcp_server
 ```
 
-### Using the released app / exe as the MCP server
+### Using the released app as the MCP server
 
-The same download works for AI agents - no Python needed:
+- **macOS:** `SpineSwissKnife.app/Contents/MacOS/SpineSwissKnife --mcp` (also `--cli <tool> ...`)
+- **Windows:** `SpineSwissKnifeMCP.exe` next to `SpineSwissKnife.exe` (the GUI exe is windowed and has no stdio)
 
-- **macOS:** `SpineSwissKnife.app/Contents/MacOS/SpineSwissKnife --mcp`
-  (also `--cli <tool> ...`)
-- **Windows:** `SpineSwissKnifeMCP.exe` next to `SpineSwissKnife.exe`
-  (the GUI exe is a windowed build without stdio, so MCP uses the console build)
+The **Claude / MCP** tool in the app shows the exact config for Claude Desktop and the `claude mcp add` command for this installation.
 
-Open the **Claude / MCP** tab in the app: it shows the exact config snippet
-for Claude Desktop (`claude_desktop_config.json`) and the `claude mcp add`
-command for Claude Code, with the correct path for this installation.
+## Known limitations
 
-## Skeleton Viewer
+- The bundled Java viewer (`GTSpineViewer_3653`, "Open Full Version") only supports Spine 3.6.53 and needs a Java runtime.
+- The built-in viewer does not evaluate transform, path or physics constraints, so those poses can differ from Spine.
+- JSON downgrade (4.x to 3.8) is lossy: unsupported features are dropped and reported as warnings.
+- Multi-skeleton `.spine` import-back is rebuilt from the exports, not edited in place.
+- The language is English only.
 
-Includes a bundled GTSpineViewer (Java) for full skeleton preview. The **Open Full Version** button launches it with the current JSON loaded.
+## Development
 
-Requires Java runtime for the external viewer.
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+QT_QPA_PLATFORM=offscreen python -m unittest discover -s tests
+```
 
-## Localization
+CI runs the tests on every push and pull request; release builds (PyInstaller, macOS and Windows) only run after they pass.
 
-English and Slovak (`EN` / `SK`). Switch via the language dropdown in the sidebar.
+## Project structure
 
-## Project Structure
+`*_core.py` modules are pure logic (no Qt) shared by the GUI tabs and the headless API.
 
 ```
 spine_swiss_knife/
-  app.py              # Main window, sidebar, config panel
-  style.py            # Dark theme QSS stylesheet
-  i18n.py             # Translation system
-  spine_json.py       # JSON load/save utilities
-  atlas_parser.py     # Spine atlas format parser
-  optimizer.py        # Image Downscaler
-  mask_optimizer.py   # Rect Mask Optimizer
-  polygon_simplify.py # Polygon Simplifier
-  keyframe_optimizer.py
-  dead_bones.py
-  hidden_attachments.py
-  unused_finder.py
-  splitter.py         # Animation Splitter
-  spine_downgrader.py
-  texture_unpacker.py
-  spine_viewer.py     # Built-in skeleton viewer
-  locales/
-    en.json
-    sk.json
-  resources/
-    icon.png / .icns / .ico
-    arrow_down.png
-GTSpineViewer_3653/   # Bundled Java skeleton viewer
-Logo/                 # App logo source files
+  Shared pure logic
+    spine_json.py       # load/save, versions, skins, backups, image keys
+    atlas_parser.py     # atlas parsing, image collection
+    spine_refs.py       # bone/slot references, draw-order offsets
+    spine_validate.py   # skeleton validator
+    spine_cli.py        # Spine command-line wrapper
+    *_core.py           # keyframe, dead_bones, hidden_attachments, mask, downscale,
+                        # splitter, merge, flatten, unused, draw_order, static_exporter
+  Headless
+    api.py  cli.py  mcp_server.py  launcher.py
+  GUI
+    app.py welcome_page.py style.py i18n.py settings.py updater.py debug_log.py
+    project_analyzer.py optimizer.py mask_optimizer.py polygon_simplify.py
+    keyframe_optimizer.py dead_bones.py hidden_attachments.py blend_switcher.py
+    draw_order_optimizer.py slot_renamer.py splitter.py spine_downgrader.py
+    texture_unpacker.py static_exporter.py image_flattener.py merge_skeletons.py
+    spine_viewer*.py unused_finder.py mcp_setup.py
+  locales/en.json
+  resources/            # icons
+GTSpineViewer_3653/     # bundled Java skeleton viewer
+Logo/
+tests/
 ```
 
 ## License

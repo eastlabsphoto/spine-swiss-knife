@@ -1,5 +1,7 @@
 """OpenGL canvas widget for Spine skeleton rendering and playback."""
 
+from __future__ import annotations
+
 from PySide6.QtCore import Qt, QPointF, QTimer, QElapsedTimer, Signal
 from PySide6.QtGui import (
     QPixmap, QPainter, QPainterPath, QTransform, QColor,
@@ -13,6 +15,7 @@ from .spine_viewer_animation import (
     build_draw_list, _evaluate_draw_order, _affine_from_triangles,
 )
 from .style import CANVAS_BG, SUBTEXT
+from .i18n import tr
 
 
 class SpineGLCanvas(QOpenGLWidget):
@@ -48,6 +51,19 @@ class SpineGLCanvas(QOpenGLWidget):
 
         self.setMinimumSize(200, 200)
 
+    # The 16 ms timer only runs while the canvas is visible.
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        t = self._track
+        if t["playing"] and t["state"] is not None and not self._timer.isActive():
+            self._elapsed.start()
+            self._timer.start()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._timer.stop()
+
     def set_base_data(self, spine_data: dict, textures: dict[str, QPixmap]):
         """Store spine data and textures; reset camera."""
         self.stop_animation()
@@ -80,7 +96,7 @@ class SpineGLCanvas(QOpenGLWidget):
         t["state"] = AnimationState(spine_data, anim_data)
         t["time"] = 0.0
         t["playing"] = True
-        if not self._timer.isActive():
+        if self.isVisible() and not self._timer.isActive():
             self._elapsed.start()
             self._timer.start()
         self._update_frame()
@@ -108,7 +124,7 @@ class SpineGLCanvas(QOpenGLWidget):
         if t["state"] is None:
             return
         t["playing"] = True
-        if not self._timer.isActive():
+        if self.isVisible() and not self._timer.isActive():
             self._elapsed.start()
             self._timer.start()
 
@@ -179,7 +195,8 @@ class SpineGLCanvas(QOpenGLWidget):
             bone_overrides=bone_ov if bone_ov else None)
         ik_constraints = self._spine_data.get("ik", [])
         if ik_constraints:
-            solve_ik_constraints(bones, wt, ik_constraints)
+            solve_ik_constraints(bones, wt, ik_constraints,
+                                 bone_overrides=bone_ov if bone_ov else None)
         dl = build_draw_list(
             self._spine_data, wt, self._textures,
             slot_states=slot_st if slot_st else None,
@@ -204,7 +221,11 @@ class SpineGLCanvas(QOpenGLWidget):
 
         if not self._draw_list:
             painter.setPen(QColor(SUBTEXT))
-            painter.drawText(self.rect(), Qt.AlignCenter, "No skeleton loaded")
+            if self._spine_data and not self._textures:
+                msg = tr("viewer.no_textures")
+            else:
+                msg = tr("viewer.no_skeleton")
+            painter.drawText(self.rect(), Qt.AlignCenter, msg)
             painter.end()
             return
 
@@ -214,7 +235,7 @@ class SpineGLCanvas(QOpenGLWidget):
         flip_sx = 1.0
         flip_sy = 1.0
 
-        clip_end = ""
+        clip_active = False
         active_clip_path = None
 
         _BLEND_MODES = {
@@ -228,9 +249,10 @@ class SpineGLCanvas(QOpenGLWidget):
 
             # Clip-end marker: stop clipping (emitted for slots with no attachment)
             if item_type == "clip_end_marker":
-                if clip_end:
+                if clip_active:
+                    painter.resetTransform()
                     painter.setClipping(False)
-                    clip_end = ""
+                    clip_active = False
                     active_clip_path = None
                 continue
 
@@ -258,7 +280,12 @@ class SpineGLCanvas(QOpenGLWidget):
                     active_clip_path = path
                     painter.resetTransform()
                     painter.setClipPath(path)
-                clip_end = item.get("clip_end", "")
+                    # A clip without "end" lasts until the end of the frame.
+                    clip_active = True
+                else:
+                    clip_active = False
+                    active_clip_path = None
+                    painter.setClipping(False)
                 continue
 
             # Render mesh attachment
@@ -313,7 +340,7 @@ class SpineGLCanvas(QOpenGLWidget):
                     tri_path.closeSubpath()
 
                     painter.resetTransform()
-                    if clip_end and active_clip_path is not None:
+                    if clip_active and active_clip_path is not None:
                         combined = active_clip_path.intersected(tri_path)
                         painter.setClipPath(combined)
                     else:
@@ -321,9 +348,11 @@ class SpineGLCanvas(QOpenGLWidget):
                     painter.setTransform(xform)
                     painter.drawPixmap(0, 0, pixmap)
 
-                # Restore clip state after mesh
+                # Restore clip state after mesh: the clip path is in screen space,
+                # so the per-triangle transform must be reset first.
+                painter.resetTransform()
                 painter.setClipping(False)
-                if clip_end and active_clip_path is not None:
+                if clip_active and active_clip_path is not None:
                     painter.setClipPath(active_clip_path)
 
                 if blend_mode is not None:

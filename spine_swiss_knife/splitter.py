@@ -3,326 +3,30 @@ Splitter tab — split a Spine project into sub-projects by animation groups.
 Each sub-project gets only the animations, bones, slots, attachments, and images it needs.
 """
 
+from __future__ import annotations
+
 import os
-import shutil
-import json as _json
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QLineEdit,
     QTabWidget, QTreeWidget, QTreeWidgetItem, QHeaderView, QMessageBox,
-    QGroupBox, QFileDialog,
+    QGroupBox, QFileDialog, QCheckBox,
 )
 from PySide6.QtCore import Qt
 
 from .i18n import tr, language_changed
-from .spine_json import load_spine_json, save_spine_json, normalize_skins, is_skins_list, denormalize_skins
+from .spine_json import load_spine_json
+from .splitter_core import (  # noqa: F401 - re-exported for existing importers
+    save_spine_format, format_spine_json, compute_dependencies,
+    build_split_json, split_to_directory, sanitize_name, sanitize_group_names,
+    _build_bone_hierarchy, _ancestors, _get_slot_bone_map,
+    _get_slot_default_attachment,
+)
 
 
 def _save_spine_format(path: str, data: dict):
     """Save Spine JSON in the same whitespace format that Spine itself exports."""
-    raw = _json.dumps(data, ensure_ascii=False, separators=(", ", ": "))
-
-    out = []
-    out.append("{")
-
-    top_keys = list(data.keys())
-    for ki, key in enumerate(top_keys):
-        val = data[key]
-        comma = "," if ki < len(top_keys) - 1 else ""
-
-        if key == "skeleton":
-            skel_str = _json.dumps(val, ensure_ascii=False, separators=(", ", ": "))
-            if skel_str.startswith("{") and skel_str.endswith("}"):
-                skel_str = "{ " + skel_str[1:-1] + " }"
-            out.append(f'"{key}": {skel_str}{comma}')
-
-        elif key == "skins" and isinstance(val, list):
-            out.append(f'"skins": [')
-            for si, skin in enumerate(val):
-                skin_comma = "," if si < len(val) - 1 else ""
-                skin_name = skin.get("name", "default")
-                skin_atts = skin.get("attachments", {})
-                out.append("{")
-                out.append(f'"name": "{skin_name}",')
-                out.append('"attachments": {')
-                slot_keys = list(skin_atts.keys())
-                for sli, slot_name in enumerate(slot_keys):
-                    slot_atts = skin_atts[slot_name]
-                    sl_comma = "," if sli < len(slot_keys) - 1 else ""
-                    att_str = _json.dumps(slot_atts, ensure_ascii=False, separators=(", ", ": "))
-                    out.append(f'"{slot_name}": {att_str}{sl_comma}')
-                out.append("}")
-                out.append(f"}}{skin_comma}")
-            out.append(f"]{comma}")
-
-        elif isinstance(val, list):
-            out.append(f'"{key}": [')
-            for vi, item in enumerate(val):
-                item_comma = "," if vi < len(val) - 1 else ""
-                item_str = _json.dumps(item, ensure_ascii=False, separators=(", ", ": "))
-                if item_str.startswith("{") and item_str.endswith("}"):
-                    item_str = "{ " + item_str[1:-1] + " }"
-                out.append(f'\t{item_str}{item_comma}')
-            out.append(f"]{comma}")
-
-        elif isinstance(val, dict) and key in ("skins", "animations", "events"):
-            out.append(f'"{key}": {{')
-            dict_keys = list(val.keys())
-            for di, dk in enumerate(dict_keys):
-                dv = val[dk]
-                dcomma = "," if di < len(dict_keys) - 1 else ""
-                if isinstance(dv, dict):
-                    out.append(f'"{dk}": {{')
-                    inner_keys = list(dv.keys())
-                    for ii, ik in enumerate(inner_keys):
-                        iv = dv[ik]
-                        icomma = "," if ii < len(inner_keys) - 1 else ""
-                        iv_str = _json.dumps(iv, ensure_ascii=False, separators=(", ", ": "))
-                        out.append(f'"{ik}": {iv_str}{icomma}')
-                    out.append(f"}}{dcomma}")
-                else:
-                    dv_str = _json.dumps(dv, ensure_ascii=False, separators=(", ", ": "))
-                    out.append(f'"{dk}": {dv_str}{dcomma}')
-            out.append(f"}}{comma}")
-
-        else:
-            val_str = _json.dumps(val, ensure_ascii=False, separators=(", ", ": "))
-            out.append(f'"{key}": {val_str}{comma}')
-
-    out.append("}")
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(out))
-
-
-# ==========================================================================
-# Core logic — determine dependencies for a set of animations
-# ==========================================================================
-
-def _build_bone_hierarchy(bones_list: list) -> dict:
-    parent_map = {}
-    bone_data_map = {}
-    for bone in bones_list:
-        name = bone["name"]
-        parent_map[name] = bone.get("parent")
-        bone_data_map[name] = bone
-    return parent_map, bone_data_map
-
-
-def _ancestors(bone_name: str, parent_map: dict) -> set:
-    result = set()
-    current = bone_name
-    while current:
-        result.add(current)
-        current = parent_map.get(current)
-    return result
-
-
-def _get_slot_bone_map(slots_list: list) -> dict:
-    return {s["name"]: s["bone"] for s in slots_list}
-
-
-def _get_slot_default_attachment(slots_list: list) -> dict:
-    return {s["name"]: s.get("attachment") for s in slots_list}
-
-
-def compute_dependencies(spine_data: dict, anim_names: list[str]) -> dict:
-    bones_list = spine_data.get("bones", [])
-    slots_list = spine_data.get("slots", [])
-    skins = normalize_skins(spine_data.get("skins", {}))
-    animations = spine_data.get("animations", {})
-
-    parent_map, bone_data_map = _build_bone_hierarchy(bones_list)
-    slot_bone_map = _get_slot_bone_map(slots_list)
-    slot_default_att = _get_slot_default_attachment(slots_list)
-
-    animated_bones = set()
-    animated_slots = set()
-    slot_att_refs = {}
-
-    for anim_name in anim_names:
-        anim = animations.get(anim_name, {})
-        for bone_name in anim.get("bones", {}):
-            animated_bones.add(bone_name)
-        for slot_name, channels in anim.get("slots", {}).items():
-            animated_slots.add(slot_name)
-            if "attachment" in channels:
-                for key in channels["attachment"]:
-                    att_name = key.get("name")
-                    if att_name is not None:
-                        slot_att_refs.setdefault(slot_name, set()).add(att_name)
-        for entry in anim.get("drawOrder", []):
-            for offset in entry.get("offsets", []):
-                if "slot" in offset:
-                    animated_slots.add(offset["slot"])
-        for slot_name in anim.get("deform", {}).get("default", {}):
-            animated_slots.add(slot_name)
-
-    bones_needed = set()
-    for bone in animated_bones:
-        bones_needed |= _ancestors(bone, parent_map)
-    for slot in animated_slots:
-        bone = slot_bone_map.get(slot)
-        if bone:
-            bones_needed |= _ancestors(bone, parent_map)
-
-    slots_needed = set()
-    for slot in slots_list:
-        if slot["bone"] in bones_needed:
-            slots_needed.add(slot["name"])
-
-    # Clipping attachments reference an "end" slot — pull those in too,
-    # along with all slots between the clip slot and end slot (draw order).
-    slot_order = [s["name"] for s in slots_list]
-    changed = True
-    while changed:
-        changed = False
-        for skin_name, skin_data in skins.items():
-            for slot_name, slot_atts in skin_data.items():
-                if slot_name not in slots_needed:
-                    continue
-                for att_name, att_data in slot_atts.items():
-                    if att_data.get("type") != "clipping":
-                        continue
-                    end_slot = att_data.get("end")
-                    if not end_slot or end_slot in slots_needed:
-                        continue
-                    # Add end slot and all slots in between
-                    if slot_name in slot_order and end_slot in slot_order:
-                        clip_idx = slot_order.index(slot_name)
-                        end_idx = slot_order.index(end_slot)
-                        for idx in range(clip_idx, end_idx + 1):
-                            s = slot_order[idx]
-                            if s not in slots_needed:
-                                slots_needed.add(s)
-                                bone = slot_bone_map.get(s)
-                                if bone:
-                                    bones_needed |= _ancestors(bone, parent_map)
-                                changed = True
-                    else:
-                        slots_needed.add(end_slot)
-                        bone = slot_bone_map.get(end_slot)
-                        if bone:
-                            bones_needed |= _ancestors(bone, parent_map)
-                        changed = True
-
-    attachments_needed = {}
-    for slot_name in slots_needed:
-        atts = set()
-        default_att = slot_default_att.get(slot_name)
-        if default_att:
-            atts.add(default_att)
-        if slot_name in slot_att_refs:
-            atts |= slot_att_refs[slot_name]
-        if not atts:
-            for skin_name, skin_data in skins.items():
-                if slot_name in skin_data:
-                    atts |= set(skin_data[slot_name].keys())
-        if atts:
-            attachments_needed[slot_name] = atts
-
-    image_keys = set()
-    for skin_name, skin_data in skins.items():
-        for slot_name, slot_atts in skin_data.items():
-            if slot_name not in attachments_needed:
-                continue
-            needed = attachments_needed[slot_name]
-            for att_name, att_data in slot_atts.items():
-                if att_name in needed:
-                    att_type = att_data.get("type")
-                    if att_type is None or att_type == "region":
-                        image_key = att_data.get("path", att_name)
-                        image_keys.add(image_key)
-
-    return {
-        "bones_needed": bones_needed,
-        "slots_needed": slots_needed,
-        "attachments_needed": attachments_needed,
-        "image_keys_needed": image_keys,
-    }
-
-
-def build_split_json(spine_data: dict, anim_names: list[str], deps: dict,
-                     group_name: str = "", images_path: str = "") -> dict:
-    bones_needed = deps["bones_needed"]
-    slots_needed = deps["slots_needed"]
-    attachments_needed = deps["attachments_needed"]
-    result = {}
-
-    if "skeleton" in spine_data:
-        result["skeleton"] = dict(spine_data["skeleton"])
-        if images_path:
-            result["skeleton"]["images"] = images_path
-
-    result["bones"] = [b for b in spine_data.get("bones", []) if b["name"] in bones_needed]
-    result["slots"] = [s for s in spine_data.get("slots", []) if s["name"] in slots_needed]
-
-    skins_normalized = normalize_skins(spine_data.get("skins", {}))
-    filtered_skins = {}
-    for skin_name, skin_data in skins_normalized.items():
-        filtered_skin = {}
-        for slot_name, slot_atts in skin_data.items():
-            if slot_name not in slots_needed:
-                continue
-            needed_atts = attachments_needed.get(slot_name, set())
-            filtered_atts = {}
-            for att_name, att_data in slot_atts.items():
-                if att_name in needed_atts or not needed_atts:
-                    filtered_atts[att_name] = att_data
-            if filtered_atts:
-                filtered_skin[slot_name] = filtered_atts
-        if filtered_skin:
-            filtered_skins[skin_name] = filtered_skin
-
-    if is_skins_list(spine_data):
-        result["skins"] = denormalize_skins(filtered_skins)
-    else:
-        result["skins"] = filtered_skins
-
-    if "events" in spine_data:
-        used_events = set()
-        for anim_name in anim_names:
-            anim = spine_data.get("animations", {}).get(anim_name, {})
-            for ev in anim.get("events", []):
-                if "name" in ev:
-                    used_events.add(ev["name"])
-        if used_events:
-            result["events"] = {k: v for k, v in spine_data["events"].items() if k in used_events}
-
-    if "ik" in spine_data:
-        result["ik"] = [
-            c for c in spine_data["ik"]
-            if c.get("target") in bones_needed
-            or any(b in bones_needed for b in c.get("bones", []))
-        ]
-        if not result["ik"]:
-            del result["ik"]
-
-    if "transform" in spine_data:
-        result["transform"] = [
-            c for c in spine_data["transform"]
-            if c.get("target") in bones_needed
-            or any(b in bones_needed for b in c.get("bones", []))
-        ]
-        if not result["transform"]:
-            del result["transform"]
-
-    if "path" in spine_data:
-        result["path"] = [
-            c for c in spine_data["path"]
-            if any(b in bones_needed for b in
-                   (c.get("bones", []) if isinstance(c.get("bones"), list) else [c.get("bones", "")]))
-        ]
-        if not result["path"]:
-            del result["path"]
-
-    result["animations"] = {
-        name: spine_data["animations"][name]
-        for name in anim_names
-        if name in spine_data.get("animations", {})
-    }
-
-    return result
+    save_spine_format(path, data)
 
 
 # ==========================================================================
@@ -368,6 +72,10 @@ class SplitterTab:
         self._images_hint_label = QLabel(tr("splitter.images_hint"))
         skel_row.addWidget(self._images_hint_label)
         layout.addLayout(skel_row)
+
+        self._static_check = QCheckBox(tr("splitter.include_static"))
+        self._static_check.setChecked(True)
+        layout.addWidget(self._static_check)
 
         self._stats = QLabel(tr("splitter.default_stats"))
         self._stats.setStyleSheet("font-weight: bold; color: #6ec072;")
@@ -420,6 +128,7 @@ class SplitterTab:
         self._images_path_label.setText(tr("splitter.images_label"))
         self._images_hint_label.setText(tr("splitter.images_hint"))
         self._stats.setText(tr("splitter.default_stats"))
+        self._static_check.setText(tr("splitter.include_static"))
         self._tree.setHeaderLabels([
             tr("splitter.tree.animation"), tr("splitter.tree.duration"),
             tr("splitter.tree.keyframes"), tr("splitter.tree.bone_kf"),
@@ -559,49 +268,12 @@ class SplitterTab:
             tr("splitter.confirm", count=len(groups), summary="\n".join(summary_lines), dir=output_dir)) != QMessageBox.Yes:
             return
 
-        json_basename = os.path.splitext(os.path.basename(json_path))[0]
-
-        all_images = {}
-        if images_dir and os.path.isdir(images_dir):
-            image_exts = {".png", ".jpg", ".jpeg", ".bmp", ".tga", ".webp"}
-            for root, dirs, files in os.walk(images_dir):
-                dirs[:] = [d for d in dirs if d not in ("_UNUSED", "_DOWNSCALE")]
-                for fname in files:
-                    ext = os.path.splitext(fname)[1].lower()
-                    if ext in image_exts:
-                        full_path = os.path.join(root, fname)
-                        rel = os.path.relpath(full_path, images_dir)
-                        key = os.path.splitext(rel)[0]
-                        all_images[key] = full_path
-
-        created = 0
-        errors = []
-        images_path_override = self._images_path_edit.text().strip()
-
-        for group_name, anim_names in sorted(groups.items()):
-            group_dir = os.path.join(output_dir, group_name)
-            group_images_dir = os.path.join(group_dir, "images")
-            os.makedirs(group_images_dir, exist_ok=True)
-            try:
-                deps = compute_dependencies(self._spine_data, anim_names)
-                split_json = build_split_json(
-                    self._spine_data, anim_names, deps,
-                    group_name=group_name, images_path=images_path_override,
-                )
-                json_out = os.path.join(group_dir, f"{group_name}.json")
-                _save_spine_format(json_out, split_json)
-                images_copied = 0
-                for image_key in deps["image_keys_needed"]:
-                    if image_key in all_images:
-                        src = all_images[image_key]
-                        rel = os.path.relpath(src, images_dir)
-                        dst = os.path.join(group_images_dir, rel)
-                        os.makedirs(os.path.dirname(dst), exist_ok=True)
-                        shutil.copy2(src, dst)
-                        images_copied += 1
-                created += 1
-            except Exception as e:
-                errors.append(f"Group '{group_name}': {e}")
+        created, errors, _details = split_to_directory(
+            self._spine_data, groups, output_dir,
+            images_dir=images_dir,
+            images_path=self._images_path_edit.text().strip(),
+            include_static_visible=self._static_check.isChecked(),
+        )
 
         msg = tr("splitter.done", created=created, total=len(groups), dir=output_dir)
         if errors:

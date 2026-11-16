@@ -3,9 +3,35 @@ name: Build & Release
 on:
   push:
     branches: [main]
+  pull_request:
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install system libraries for Qt (offscreen)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m unittest discover -s tests
+
   check-version:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.get_version.outputs.version }}
@@ -34,7 +60,7 @@ jobs:
           fi
 
   build-macos:
-    needs: check-version
+    needs: [check-version, test]
     if: needs.check-version.outputs.should_build == 'true'
     runs-on: macos-latest
     steps:
@@ -47,7 +73,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
+          pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Build with PyInstaller
         run: pyinstaller spine_swiss_knife.spec
@@ -63,7 +89,7 @@ jobs:
           path: SpineSwissKnife-macOS.zip
 
   build-windows:
-    needs: check-version
+    needs: [check-version, test]
     if: needs.check-version.outputs.should_build == 'true'
     runs-on: windows-latest
     steps:
@@ -76,7 +102,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
+          pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Build with PyInstaller
         run: pyinstaller spine_swiss_knife.spec
@@ -90,7 +116,7 @@ jobs:
           path: SpineSwissKnife-Windows.zip
 
   release:
-    needs: [check-version, build-macos, build-windows]
+    needs: [check-version, test, build-macos, build-windows]
     if: needs.check-version.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     permissions:

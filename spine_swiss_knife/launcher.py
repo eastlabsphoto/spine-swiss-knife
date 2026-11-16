@@ -40,7 +40,69 @@ def mcp_command() -> tuple[str, list[str]]:
             console_exe = exe.with_name(WINDOWS_MCP_EXE)
             return (str(console_exe if console_exe.exists() else exe), [])
         return str(exe), ["--mcp"]
+    # Running from source: MCP clients start the server from an arbitrary
+    # working directory, so "-m spine_swiss_knife..." would not be found.
+    # The launcher script next to the package works from anywhere.
+    script = Path(__file__).resolve().parent.parent / "spine_swiss_knife.py"
+    if script.is_file():
+        return sys.executable, [str(script), "--mcp"]
     return sys.executable, ["-m", "spine_swiss_knife.mcp_server"]
+
+
+def install_claude_desktop_config(config_path: Optional[str] = None) -> dict:
+    """Add this installation's MCP server to Claude Desktop's config file.
+
+    Other entries in the file are kept. Returns ``{"path", "status", "backup"}``
+    where status is ``"added"``, ``"updated"`` or ``"unchanged"``. An existing
+    file is copied to ``<file>.ssk-backup`` before it is changed.
+
+    Raises FileNotFoundError when Claude Desktop's config folder does not exist
+    (Claude Desktop is not installed) and ValueError when the existing file is
+    not a JSON object - the file is never overwritten in those cases.
+    """
+    import os
+    import shutil
+
+    path = Path(config_path or claude_desktop_config_path())
+    if not path.parent.is_dir():
+        raise FileNotFoundError(f"Claude Desktop folder not found: {path.parent}")
+
+    data: dict = {}
+    existed = path.is_file()
+    if existed:
+        text = path.read_text(encoding="utf-8")
+        if text.strip():
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"{path.name} is not valid JSON ({e})") from e
+            if not isinstance(data, dict):
+                raise ValueError(f"{path.name} does not contain a JSON object")
+
+    servers = data.get("mcpServers")
+    if servers is None:
+        servers = data["mcpServers"] = {}
+    elif not isinstance(servers, dict):
+        raise ValueError(f'"mcpServers" in {path.name} is not an object')
+
+    cmd, args = mcp_command()
+    entry = {"command": cmd, "args": args}
+    previous = servers.get(MCP_SERVER_NAME)
+    if previous == entry:
+        return {"path": str(path), "status": "unchanged", "backup": ""}
+
+    backup = ""
+    if existed:
+        backup = str(path) + ".ssk-backup"
+        shutil.copy2(str(path), backup)
+    servers[MCP_SERVER_NAME] = entry
+    tmp = path.with_name(path.name + ".ssk-tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+                   encoding="utf-8")
+    os.replace(str(tmp), str(path))
+    return {"path": str(path),
+            "status": "updated" if previous is not None else "added",
+            "backup": backup}
 
 
 def claude_desktop_config_snippet() -> str:

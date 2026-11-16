@@ -1,5 +1,7 @@
 """Compare dialog — side-by-side, wipe, and overlay viewer for draw order comparison."""
 
+from __future__ import annotations
+
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QSlider, QComboBox, QStackedWidget, QDialog, QApplication,
@@ -280,6 +282,25 @@ class CompareDialog(QDialog):
             lambda z: self._sync_zoom(z, self._right_canvas))
         self._right_canvas.zoom_changed.connect(
             lambda z: self._sync_zoom(z, self._left_canvas))
+
+    # ── Lifecycle ────────────────────────────────────────────────────
+
+    def _stop_timers(self):
+        """Stop the composite repaint timer and both canvases' animations."""
+        self._composite.stop()
+        for canvas in (self._left_canvas, self._right_canvas):
+            try:
+                canvas.stop_animation()
+            except Exception:
+                pass
+
+    def done(self, result):
+        self._stop_timers()
+        super().done(result)
+
+    def closeEvent(self, event):
+        self._stop_timers()
+        super().closeEvent(event)
 
     # ── Slots ────────────────────────────────────────────────────────
 

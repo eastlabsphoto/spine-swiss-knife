@@ -4,6 +4,9 @@ Pure computational logic extracted from the viewer.  Only uses Qt types
 as data values (QPixmap, QTransform, QPainter) — no widget dependency.
 """
 
+from __future__ import annotations
+
+import logging
 import math
 import os
 
@@ -12,9 +15,20 @@ from PySide6.QtGui import QPixmap, QPainter, QTransform, QPolygonF, QPainterPath
 
 from .spine_json import (
     normalize_skins, attachment_image_key, clip_end_marker_after_slot,
-    mesh_is_weighted, resolve_weighted_vertices,
+    mesh_is_weighted, resolve_weighted_vertices, is_spine4, is_weighted,
+    iter_deform_timelines, get_draw_order_timeline,
 )
+from .spine_refs import apply_draw_order_offsets
 from .texture_unpacker import parse_spine_atlas
+
+_log = logging.getLogger(__name__)
+_warned: set = set()
+
+
+def _warn_once(msg: str) -> None:
+    if msg not in _warned:
+        _warned.add(msg)
+        _log.warning(msg)
 
 
 # ==========================================================================
@@ -36,14 +50,18 @@ def _color_to_floats(color_hex: str) -> tuple[float, float, float, float]:
 # ==========================================================================
 
 def _bezier_interpolate(curve: list, alpha: float) -> float:
-    """Evaluate cubic bezier curve weight for a given time alpha.
+    """Evaluate a NORMALISED cubic bezier (3.x) for a given time ratio.
 
-    curve = [cx1, cy1, cx2, cy2] — control points for cubic bezier.
+    curve = [cx1, cy1, cx2, cy2] — control points of a bezier from (0,0) to (1,1).
     Binary search for t where bezier_x(t) ~ alpha, returns bezier_y(t).
     """
+    if alpha <= 0.0:
+        return 0.0
+    if alpha >= 1.0:
+        return 1.0
     cx1, cy1, cx2, cy2 = curve[0], curve[1], curve[2], curve[3]
     lo, hi = 0.0, 1.0
-    for _ in range(20):
+    for _ in range(24):
         t = (lo + hi) * 0.5
         u = 1.0 - t
         x = 3.0 * u * u * t * cx1 + 3.0 * u * t * t * cx2 + t * t * t
@@ -56,8 +74,35 @@ def _bezier_interpolate(curve: list, alpha: float) -> float:
     return 3.0 * u * u * t * cy1 + 3.0 * u * t * t * cy2 + t * t * t
 
 
+def _bezier_absolute(t1: float, v1: float, cx1: float, cy1: float,
+                     cx2: float, cy2: float, t2: float, v2: float,
+                     time: float) -> float:
+    """Value at ``time`` of a 4.x bezier segment with ABSOLUTE control points.
+
+    Control points are (t1, v1), (cx1, cy1), (cx2, cy2), (t2, v2).
+    """
+    if time <= t1:
+        return v1
+    if time >= t2:
+        return v2
+    lo, hi = 0.0, 1.0
+    for _ in range(30):
+        s = (lo + hi) * 0.5
+        u = 1.0 - s
+        x = (u * u * u * t1 + 3.0 * u * u * s * cx1
+             + 3.0 * u * s * s * cx2 + s * s * s * t2)
+        if x < time:
+            lo = s
+        else:
+            hi = s
+    s = (lo + hi) * 0.5
+    u = 1.0 - s
+    return (u * u * u * v1 + 3.0 * u * u * s * cy1
+            + 3.0 * u * s * s * cy2 + s * s * s * v2)
+
+
 def _get_bezier_alpha(curve, alpha: float) -> float:
-    """Get interpolation weight from curve specification."""
+    """Get interpolation weight from a (normalised) curve specification."""
     if curve == "stepped":
         return -1.0  # sentinel for stepped
     if isinstance(curve, list) and len(curve) >= 4:
@@ -65,22 +110,50 @@ def _get_bezier_alpha(curve, alpha: float) -> float:
     return alpha  # linear
 
 
-def _interpolate_timeline(keys: list, time: float, fields: tuple, defaults: dict) -> dict:
-    """Interpolate numeric fields across a keyframe timeline at given time.
+def _segment_alpha(left: dict, t1: float, t2: float, time: float,
+                   v1: float, v2: float, v4: bool, channel: int = 0):
+    """Interpolation weight within the segment that starts at key ``left``.
 
-    Supports linear (default), stepped, and cubic bezier interpolation.
+    Returns None for a stepped segment.  Handles the three JSON curve formats:
+    3.7- (list of 4 normalised numbers), 3.8 (``curve``/``c2``/``c3``/``c4``
+    scalars, normalised) and 4.x (4 absolute numbers per value channel).
     """
+    curve = left.get("curve")
+    if curve == "stepped":
+        return None
+    dt = t2 - t1
+    lin = (time - t1) / dt if dt > 0 else 0.0
+    if isinstance(curve, (int, float)) and not isinstance(curve, bool):
+        return _bezier_interpolate(
+            [curve, left.get("c2", 0.0), left.get("c3", 1.0), left.get("c4", 1.0)], lin)
+    if isinstance(curve, list) and len(curve) >= 4:
+        if not v4:
+            return _bezier_interpolate(curve, lin)
+        base = min(4 * channel, len(curve) - 4)
+        cx1, cy1, cx2, cy2 = curve[base:base + 4]
+        if abs(v2 - v1) < 1e-12:
+            return lin
+        y = _bezier_absolute(t1, v1, cx1, cy1, cx2, cy2, t2, v2, time)
+        return (y - v1) / (v2 - v1)
+    return lin
+
+
+def _wrap_angle_delta(delta: float) -> float:
+    """Wrap an angle delta into [-180, 180] (3.x runtime behaviour)."""
+    return delta - (16384 - int(16384.5 - delta / 360.0)) * 360.0
+
+
+def _interpolate_vector(keys: list, time: float, extract, v4: bool = False,
+                        wrap_channels=()) -> list:
+    """Interpolate a timeline whose keys convert to float vectors by ``extract``."""
     n = len(keys)
     if n == 0:
-        return dict(defaults)
-
+        return []
     if time <= keys[0].get("time", 0):
-        return {f: keys[0].get(f, defaults[f]) for f in fields}
-
+        return list(extract(keys[0]))
     if time >= keys[-1].get("time", 0):
-        return {f: keys[-1].get(f, defaults[f]) for f in fields}
+        return list(extract(keys[-1]))
 
-    # Binary search: find lo where keys[lo].time <= time < keys[lo+1].time
     lo, hi = 0, n - 2
     while lo < hi:
         mid = (lo + hi + 1) // 2
@@ -91,59 +164,69 @@ def _interpolate_timeline(keys: list, time: float, fields: tuple, defaults: dict
 
     left = keys[lo]
     right = keys[lo + 1]
-    dt = right.get("time", 0) - left.get("time", 0)
-    alpha = (time - left.get("time", 0)) / dt if dt > 0 else 0.0
-
-    curve = left.get("curve")
-    if curve == "stepped":
-        return {f: left.get(f, defaults[f]) for f in fields}
-    if isinstance(curve, list) and len(curve) >= 4:
-        alpha = _bezier_interpolate(curve, alpha)
-
-    result = {}
-    for f in fields:
-        v0 = float(left.get(f, defaults[f]))
-        v1 = float(right.get(f, defaults[f]))
-        result[f] = v0 + (v1 - v0) * alpha
-    return result
-
-
-def _interpolate_color(keys: list, time: float) -> tuple[float, float, float, float]:
-    """Interpolate color timeline at given time. Returns (r, g, b, a) floats."""
-    if not keys:
-        return (1.0, 1.0, 1.0, 1.0)
-
-    if time <= keys[0].get("time", 0):
-        return _color_to_floats(keys[0].get("color", "ffffffff"))
-
-    if time >= keys[-1].get("time", 0):
-        return _color_to_floats(keys[-1].get("color", "ffffffff"))
-
-    lo, hi = 0, len(keys) - 2
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if keys[mid].get("time", 0) <= time:
-            lo = mid
+    t1 = left.get("time", 0)
+    t2 = right.get("time", 0)
+    lv = extract(left)
+    rv = extract(right)
+    out = []
+    for k in range(min(len(lv), len(rv))):
+        v1 = float(lv[k])
+        v2 = float(rv[k])
+        if not v4 and k in wrap_channels:
+            v2 = v1 + _wrap_angle_delta(v2 - v1)
+        alpha = _segment_alpha(left, t1, t2, time, v1, v2, v4, k)
+        if alpha is None:
+            out.append(v1)
         else:
-            hi = mid - 1
-
-    left = keys[lo]
-    right = keys[lo + 1]
-    dt = right.get("time", 0) - left.get("time", 0)
-    alpha = (time - left.get("time", 0)) / dt if dt > 0 else 0.0
-
-    curve = left.get("curve")
-    if curve == "stepped":
-        return _color_to_floats(left.get("color", "ffffffff"))
-    if isinstance(curve, list) and len(curve) >= 4:
-        alpha = _bezier_interpolate(curve, alpha)
-
-    lc = _color_to_floats(left.get("color", "ffffffff"))
-    rc = _color_to_floats(right.get("color", "ffffffff"))
-    return tuple(l + (r - l) * alpha for l, r in zip(lc, rc))
+            out.append(v1 + (v2 - v1) * alpha)
+    return out
 
 
-def _interpolate_deform(keys: list, time: float) -> list[float]:
+def _interpolate_timeline(keys: list, time: float, fields: tuple, defaults: dict,
+                          v4: bool = False, wrap_fields: tuple = ()) -> dict:
+    """Interpolate numeric fields across a keyframe timeline at given time.
+
+    Supports linear (default), stepped, and cubic bezier interpolation in the
+    3.7-, 3.8 and 4.x curve formats.  ``wrap_fields`` (3.x rotation) take the
+    shortest way around between consecutive keys; ignored for 4.x.
+    """
+    if not keys:
+        return dict(defaults)
+
+    def extract(key):
+        return [float(key.get(f, defaults[f])) for f in fields]
+
+    wrap = tuple(i for i, f in enumerate(fields) if f in wrap_fields)
+    vals = _interpolate_vector(keys, time, extract, v4, wrap)
+    return {f: vals[i] for i, f in enumerate(fields)}
+
+
+def _hex_channels(color_hex, count: int, default: str) -> list:
+    """Parse "rrggbb[aa]" into the first ``count`` float channels."""
+    if not isinstance(color_hex, str) or len(color_hex) < 6:
+        color_hex = default
+    try:
+        vals = _color_to_floats(color_hex)
+    except ValueError:
+        vals = _color_to_floats(default)
+    return list(vals[:count])
+
+
+def _interpolate_color(keys: list, time: float, v4: bool = False,
+                       field: str = "color", count: int = 4
+                       ) -> tuple[float, ...]:
+    """Interpolate a colour timeline at given time. Returns ``count`` floats
+    (r, g, b, a by default)."""
+    if not keys:
+        return (1.0,) * count
+
+    def extract(key):
+        return _hex_channels(key.get(field), count, "ffffffff")
+
+    return tuple(_interpolate_vector(keys, time, extract, v4))
+
+
+def _interpolate_deform(keys: list, time: float, v4: bool = False) -> list[float]:
     """Interpolate deform timeline — element-wise lerp of vertex delta arrays.
 
     Each key has {"time": t, "vertices": [full expanded deltas], "curve": ...}.
@@ -170,14 +253,10 @@ def _interpolate_deform(keys: list, time: float) -> list[float]:
 
     left = keys[lo]
     right = keys[lo + 1]
-    dt = right["time"] - left["time"]
-    alpha = (time - left["time"]) / dt if dt > 0 else 0.0
-
-    curve = left.get("curve")
-    if curve == "stepped":
+    # One curve channel drives all values; 4.x control points are in 0..1 value units.
+    alpha = _segment_alpha(left, left["time"], right["time"], time, 0.0, 1.0, v4, 0)
+    if alpha is None:
         return left["vertices"]
-    if isinstance(curve, list) and len(curve) >= 4:
-        alpha = _bezier_interpolate(curve, alpha)
 
     lv = left["vertices"]
     rv = right["vertices"]
@@ -214,7 +293,11 @@ def _affine_from_triangles(src, dst) -> QTransform | None:
 # ==========================================================================
 
 def _evaluate_draw_order(base_slots: list, draw_order_keys: list, time: float) -> list:
-    """Evaluate draw order timeline, returning reordered slot list."""
+    """Evaluate draw order timeline, returning reordered slot list.
+
+    Decoded exactly like the runtimes (``apply_draw_order_offsets``).  Invalid
+    offsets fall back to the setup order (logged once).
+    """
     if not draw_order_keys:
         return base_slots
 
@@ -232,94 +315,138 @@ def _evaluate_draw_order(base_slots: list, draw_order_keys: list, time: float) -
     if not offsets_list:
         return base_slots
 
-    n = len(base_slots)
-    slot_index = {slot["name"]: i for i, slot in enumerate(base_slots)}
+    names = [slot["name"] for slot in base_slots]
+    try:
+        order = apply_draw_order_offsets(names, offsets_list)
+    except ValueError as exc:
+        _warn_once("Invalid draw order key, using setup order: %s" % exc)
+        return base_slots
 
-    offset_map = {}
-    for entry in offsets_list:
-        sname = entry.get("slot", "")
-        off = entry.get("offset", 0)
-        if sname in slot_index:
-            orig = slot_index[sname]
-            offset_map[orig] = max(0, min(n - 1, orig + off))
-
-    result = [None] * n
-    used = set()
-    for orig, target in offset_map.items():
-        result[target] = base_slots[orig]
-        used.add(target)
-
-    unchanged = [base_slots[i] for i in range(n) if i not in offset_map]
-    j = 0
-    for i in range(n):
-        if i not in used:
-            if j < len(unchanged):
-                result[i] = unchanged[j]
-                j += 1
-
-    return [s for s in result if s is not None]
+    by_name: dict = {}
+    for slot in base_slots:
+        by_name.setdefault(slot["name"], slot)
+    return [by_name[name] for name in order]
 
 
 # ==========================================================================
 # Animation State Evaluator
 # ==========================================================================
 
+def _max_key_time(node) -> float:
+    """Largest ``time`` of any keyframe dict found anywhere inside ``node``."""
+    best = 0.0
+    if isinstance(node, list):
+        for item in node:
+            if isinstance(item, dict):
+                t = item.get("time", 0)
+                if isinstance(t, (int, float)) and t > best:
+                    best = t
+                best = max(best, _max_key_time(item))
+    elif isinstance(node, dict):
+        for value in node.values():
+            if isinstance(value, (list, dict)):
+                best = max(best, _max_key_time(value))
+    return best
+
+
+def _resolve_linked_mesh(skins: dict, skin_name, slot_name: str, att_data: dict,
+                         fallback_skins=("default",)):
+    """Follow a linkedmesh chain to its parent mesh.
+
+    Returns (parent_skin, parent_name, parent_data) or None when unresolved.
+    ``skin_name`` is the skin the linked mesh itself was found in.
+    """
+    seen = 0
+    cur = att_data
+    cur_skin = skin_name
+    while isinstance(cur, dict) and cur.get("type") == "linkedmesh" and seen < 16:
+        seen += 1
+        parent = cur.get("parent")
+        if not parent:
+            return None
+        order = []
+        if cur.get("skin"):
+            order.append(cur["skin"])
+        if cur_skin is not None:
+            order.append(cur_skin)
+        order.extend(fallback_skins)
+        found = None
+        for sk in order:
+            cand = skins.get(sk, {}).get(slot_name, {}).get(parent)
+            if cand is not None:
+                found = (sk, parent, cand)
+                break
+        if found is None:
+            return None
+        cur_skin, _pname, cur = found
+        if cur.get("type") != "linkedmesh":
+            return found
+        att_data = cur
+    return None
+
+
+def _rotate_field(keys: list, v4: bool) -> str:
+    """Rotate keys use ``angle`` (3.x) or ``value`` (4.x); be lenient about both."""
+    primary, other = ("value", "angle") if v4 else ("angle", "value")
+    if any(primary in k for k in keys):
+        return primary
+    if any(other in k for k in keys):
+        return other
+    return primary
+
+
 class AnimationState:
     """Evaluates animation timelines at a given time."""
 
     def __init__(self, spine_data: dict, anim_data: dict):
+        self._v4 = is_spine4(spine_data or {})
         self._bone_timelines = anim_data.get("bones", {})
         self._slot_timelines = anim_data.get("slots", {})
-        self._draw_order_keys = anim_data.get("drawOrder",
-                                               anim_data.get("draworder", []))
+        self._draw_order_keys = get_draw_order_timeline(anim_data)
 
-        # Pre-process deform timelines
-        self._deform_timelines: dict[tuple[str, str], list] = {}
-        skins = normalize_skins(spine_data.get("skins", {}))
-        for skin_name, skin_slots in anim_data.get("deform", {}).items():
-            for slot_name, slot_atts in skin_slots.items():
-                for att_name, keys in slot_atts.items():
-                    att = skins.get(skin_name, {}).get(slot_name, {}).get(att_name, {})
-                    vc = att.get("vertexCount", 0)
-                    if vc == 0:
-                        vc = len(att.get("vertices", [])) // 2
-                    n_floats = vc * 2
+        # Pre-process deform timelines (ffd / deform / 4.1+ attachments)
+        self._deform_timelines: dict[tuple, list] = {}
+        skins = normalize_skins((spine_data or {}).get("skins", {}))
+        for skin_name, slot_name, att_name, keys in iter_deform_timelines(anim_data):
+            att = skins.get(skin_name, {}).get(slot_name, {}).get(att_name)
+            if att is None:
+                for sk in skins.values():
+                    if att_name in sk.get(slot_name, {}):
+                        att = sk[slot_name][att_name]
+                        break
+            att = att or {}
+            if att.get("type") == "linkedmesh":
+                res = _resolve_linked_mesh(skins, skin_name, slot_name, att)
+                if res is not None:
+                    att = res[2]
+            verts = att.get("vertices", [])
+            n_floats = None
+            if att.get("type") in ("mesh", "linkedmesh") and not is_weighted(att):
+                n_floats = len(verts)
+            elif att.get("type") in ("clipping", "boundingbox", "path") \
+                    and not is_weighted(att):
+                n_floats = len(verts)
 
-                    expanded = []
-                    for key in keys:
-                        full = [0.0] * n_floats
-                        offset = key.get("offset", 0)
-                        deltas = key.get("vertices", [])
-                        for i, v in enumerate(deltas):
-                            idx = offset + i
-                            if idx < n_floats:
-                                full[idx] = v
-                        expanded.append({
-                            "time": key.get("time", 0),
-                            "vertices": full,
-                            "curve": key.get("curve"),
-                        })
-                    self._deform_timelines[(slot_name, att_name)] = expanded
-
-        self.duration = 0.0
-        for section in (self._bone_timelines, self._slot_timelines):
-            for _name, channels in section.items():
-                for _ch, keys in channels.items():
-                    if isinstance(keys, list):
-                        for key in keys:
-                            t = key.get("time", 0)
-                            if t > self.duration:
-                                self.duration = t
-        for key in self._draw_order_keys:
-            t = key.get("time", 0)
-            if t > self.duration:
-                self.duration = t
-        for keys in self._deform_timelines.values():
+            expanded = []
             for key in keys:
-                t = key.get("time", 0)
-                if t > self.duration:
-                    self.duration = t
+                deltas = key.get("vertices", [])
+                offset = key.get("offset", 0)
+                size = n_floats if n_floats is not None else offset + len(deltas)
+                full = [0.0] * size
+                for i, v in enumerate(deltas):
+                    idx = offset + i
+                    if idx < size:
+                        full[idx] = v
+                expanded.append({
+                    "time": key.get("time", 0),
+                    "vertices": full,
+                    "curve": key.get("curve"),
+                })
+            self._deform_timelines[(skin_name, slot_name, att_name)] = expanded
 
+        # Duration: the last keyframe of ANY timeline (bones, slots, constraints,
+        # deform in all formats, draw order, events).
+        self.duration = float(_max_key_time(anim_data))
         if self.duration <= 0:
             self.duration = 0.001
 
@@ -327,37 +454,64 @@ class AnimationState:
         """Returns (bone_overrides, slot_states, deform_states).
 
         bone_overrides: {bone_name: {x, y, rotation, scaleX, scaleY, shearX, shearY}}
-        slot_states: {slot_name: {attachment: name|None, color: (r,g,b,a)}}
-        deform_states: {(slot_name, att_name): [deformed_vertex_deltas]}
+        slot_states: {slot_name: {attachment: name|None, color: (r,g,b,a),
+                                  rgb: (r,g,b), alpha: a}}
+        deform_states: {(slot_name, att_name): [deltas],
+                        (skin_name, slot_name, att_name): [deltas]}
         """
+        v4 = self._v4
         bone_overrides: dict[str, dict] = {}
         slot_states: dict[str, dict] = {}
 
         for bone_name, timelines in self._bone_timelines.items():
+            if not isinstance(timelines, dict):
+                continue
             ov = {}
             if "translate" in timelines:
                 vals = _interpolate_timeline(
-                    timelines["translate"], time, ("x", "y"), {"x": 0, "y": 0})
+                    timelines["translate"], time, ("x", "y"), {"x": 0, "y": 0}, v4)
                 ov["x"] = vals["x"]
                 ov["y"] = vals["y"]
+            if "translatex" in timelines:
+                ov["x"] = _interpolate_timeline(
+                    timelines["translatex"], time, ("value",), {"value": 0}, v4)["value"]
+            if "translatey" in timelines:
+                ov["y"] = _interpolate_timeline(
+                    timelines["translatey"], time, ("value",), {"value": 0}, v4)["value"]
             if "rotate" in timelines:
+                keys = timelines["rotate"]
+                field = _rotate_field(keys, v4)
                 vals = _interpolate_timeline(
-                    timelines["rotate"], time, ("angle",), {"angle": 0})
-                ov["rotation"] = vals["angle"]
+                    keys, time, (field,), {field: 0}, v4, wrap_fields=(field,))
+                ov["rotation"] = vals[field]
             if "scale" in timelines:
                 vals = _interpolate_timeline(
-                    timelines["scale"], time, ("x", "y"), {"x": 1, "y": 1})
+                    timelines["scale"], time, ("x", "y"), {"x": 1, "y": 1}, v4)
                 ov["scaleX"] = vals["x"]
                 ov["scaleY"] = vals["y"]
+            if "scalex" in timelines:
+                ov["scaleX"] = _interpolate_timeline(
+                    timelines["scalex"], time, ("value",), {"value": 1}, v4)["value"]
+            if "scaley" in timelines:
+                ov["scaleY"] = _interpolate_timeline(
+                    timelines["scaley"], time, ("value",), {"value": 1}, v4)["value"]
             if "shear" in timelines:
                 vals = _interpolate_timeline(
-                    timelines["shear"], time, ("x", "y"), {"x": 0, "y": 0})
+                    timelines["shear"], time, ("x", "y"), {"x": 0, "y": 0}, v4)
                 ov["shearX"] = vals["x"]
                 ov["shearY"] = vals["y"]
+            if "shearx" in timelines:
+                ov["shearX"] = _interpolate_timeline(
+                    timelines["shearx"], time, ("value",), {"value": 0}, v4)["value"]
+            if "sheary" in timelines:
+                ov["shearY"] = _interpolate_timeline(
+                    timelines["sheary"], time, ("value",), {"value": 0}, v4)["value"]
             if ov:
                 bone_overrides[bone_name] = ov
 
         for slot_name, timelines in self._slot_timelines.items():
+            if not isinstance(timelines, dict):
+                continue
             state = {}
             if "attachment" in timelines:
                 keys = timelines["attachment"]
@@ -369,14 +523,37 @@ class AnimationState:
                         break
                 if att_key is not None:
                     state["attachment"] = att_key.get("name")
+            # 3.x colour / twoColor, 4.x rgba / rgba2 (light part) -> full colour
             if "color" in timelines:
-                state["color"] = _interpolate_color(timelines["color"], time)
+                state["color"] = _interpolate_color(timelines["color"], time, v4)
+            if "twoColor" in timelines:
+                state["color"] = _interpolate_color(
+                    timelines["twoColor"], time, v4, field="light")
+            if "rgba" in timelines:
+                state["color"] = _interpolate_color(timelines["rgba"], time, v4)
+            if "rgba2" in timelines:
+                state["color"] = _interpolate_color(
+                    timelines["rgba2"], time, v4, field="light")
+            if "rgb" in timelines:
+                state["rgb"] = _interpolate_color(
+                    timelines["rgb"], time, v4, count=3)
+            if "rgb2" in timelines:
+                state["rgb"] = _interpolate_color(
+                    timelines["rgb2"], time, v4, field="light", count=3)
+            if "alpha" in timelines:
+                state["alpha"] = _interpolate_timeline(
+                    timelines["alpha"], time, ("value",), {"value": 0}, v4)["value"]
             if state:
                 slot_states[slot_name] = state
 
-        deform_states: dict[tuple[str, str], list] = {}
-        for key, keys in self._deform_timelines.items():
-            deform_states[key] = _interpolate_deform(keys, time)
+        deform_states: dict[tuple, list] = {}
+        # "default"-skin timelines win the plain (slot, attachment) key
+        ordered = sorted(self._deform_timelines.items(),
+                         key=lambda kv: 0 if kv[0][0] == "default" else 1)
+        for (skin_name, slot_name, att_name), keys in ordered:
+            vals = _interpolate_deform(keys, time, v4)
+            deform_states[(skin_name, slot_name, att_name)] = vals
+            deform_states.setdefault((slot_name, att_name), vals)
 
         return bone_overrides, slot_states, deform_states
 
@@ -386,8 +563,13 @@ class AnimationState:
 # ==========================================================================
 
 class BoneTransform:
-    """World transform for a single bone: position + 2x2 affine matrix."""
-    __slots__ = ("worldX", "worldY", "a", "b", "c", "d")
+    """World transform for a single bone: position + 2x2 affine matrix.
+
+    ``pose`` holds the local pose (x, y, rotation, scaleX, scaleY, shearX,
+    shearY) the transform was computed from, ``mode`` its inherit mode, so
+    constraints can re-solve from the animated pose instead of the setup pose.
+    """
+    __slots__ = ("worldX", "worldY", "a", "b", "c", "d", "pose", "mode")
 
     def __init__(self):
         self.worldX = 0.0
@@ -396,6 +578,133 @@ class BoneTransform:
         self.b = 0.0
         self.c = 0.0
         self.d = 1.0
+        self.pose = None
+        self.mode = "normal"
+
+
+_INHERIT_MODES = ("normal", "onlyTranslation", "noRotationOrReflection",
+                  "noScale", "noScaleOrReflection")
+
+
+def _inherit_mode(bone: dict) -> str:
+    """Inherit mode of a bone: 4.2 ``inherit``, 3.x/4.0/4.1 ``transform`` or the
+    very old ``inheritRotation`` / ``inheritScale`` flags."""
+    for field in ("inherit", "transform"):
+        val = bone.get(field)
+        if isinstance(val, str) and val in _INHERIT_MODES:
+            return val
+    rot = bone.get("inheritRotation", True)
+    scale = bone.get("inheritScale", True)
+    if rot is False and scale is False:
+        return "onlyTranslation"
+    if rot is False:
+        return "noRotationOrReflection"
+    if scale is False:
+        return "noScale"
+    return "normal"
+
+
+def _local_matrix(rotation: float, sx: float, sy: float,
+                  shear_x: float, shear_y: float):
+    """Local 2x2 matrix (la, lb, lc, ld) of a bone, angles in degrees."""
+    rx = math.radians(rotation + shear_x)
+    ry = math.radians(rotation + 90.0 + shear_y)
+    return (math.cos(rx) * sx, math.cos(ry) * sy,
+            math.sin(rx) * sx, math.sin(ry) * sy)
+
+
+def _apply_local_pose(bt: BoneTransform, parent: BoneTransform | None,
+                      pose: tuple, mode: str = "normal") -> None:
+    """Compute the world transform of a bone from its local pose and parent."""
+    lx, ly, rotation, sx, sy, shear_x, shear_y = pose
+    bt.pose = pose
+    bt.mode = mode
+
+    if parent is None:
+        bt.worldX = lx
+        bt.worldY = ly
+        bt.a, bt.b, bt.c, bt.d = _local_matrix(rotation, sx, sy, shear_x, shear_y)
+        return
+
+    pa, pb, pc, pd = parent.a, parent.b, parent.c, parent.d
+    bt.worldX = pa * lx + pb * ly + parent.worldX
+    bt.worldY = pc * lx + pd * ly + parent.worldY
+
+    if mode == "onlyTranslation":
+        bt.a, bt.b, bt.c, bt.d = _local_matrix(rotation, sx, sy, shear_x, shear_y)
+    elif mode == "noRotationOrReflection":
+        s = pa * pa + pc * pc
+        if s > 1e-4:
+            s = abs(pa * pd - pb * pc) / s
+            pb = pc * s
+            pd = pa * s
+            prx = math.degrees(math.atan2(pc, pa))
+        else:
+            pa = 0.0
+            pc = 0.0
+            prx = 90.0 - math.degrees(math.atan2(pd, pb))
+        rx = math.radians(rotation + shear_x - prx)
+        ry = math.radians(rotation + shear_y - prx + 90.0)
+        la = math.cos(rx) * sx
+        lb = math.cos(ry) * sy
+        lc = math.sin(rx) * sx
+        ld = math.sin(ry) * sy
+        bt.a = pa * la - pb * lc
+        bt.b = pa * lb - pb * ld
+        bt.c = pc * la + pd * lc
+        bt.d = pc * lb + pd * ld
+    elif mode in ("noScale", "noScaleOrReflection"):
+        cos_r = math.cos(math.radians(rotation))
+        sin_r = math.sin(math.radians(rotation))
+        za = pa * cos_r + pb * sin_r
+        zc = pc * cos_r + pd * sin_r
+        s = math.sqrt(za * za + zc * zc)
+        if s > 1e-5:
+            s = 1.0 / s
+        za *= s
+        zc *= s
+        s = math.sqrt(za * za + zc * zc)
+        if mode == "noScale" and (pa * pd - pb * pc < 0):
+            s = -s
+        r = math.pi / 2.0 + math.atan2(zc, za)
+        zb = math.cos(r) * s
+        zd = math.sin(r) * s
+        sx_r = math.radians(shear_x)
+        sy_r = math.radians(90.0 + shear_y)
+        la = math.cos(sx_r) * sx
+        lb = math.cos(sy_r) * sy
+        lc = math.sin(sx_r) * sx
+        ld = math.sin(sy_r) * sy
+        bt.a = za * la + zb * lc
+        bt.b = za * lb + zb * ld
+        bt.c = zc * la + zd * lc
+        bt.d = zc * lb + zd * ld
+    else:
+        la, lb, lc, ld = _local_matrix(rotation, sx, sy, shear_x, shear_y)
+        bt.a = pa * la + pb * lc
+        bt.b = pa * lb + pb * ld
+        bt.c = pc * la + pd * lc
+        bt.d = pc * lb + pd * ld
+
+
+def _setup_pose(bone: dict) -> tuple:
+    return (bone.get("x", 0.0), bone.get("y", 0.0), bone.get("rotation", 0.0),
+            bone.get("scaleX", 1.0), bone.get("scaleY", 1.0),
+            bone.get("shearX", 0.0), bone.get("shearY", 0.0))
+
+
+def _animated_pose(bone: dict, ov: dict | None) -> tuple:
+    """Setup pose combined with an animation override (additive / multiplicative)."""
+    lx, ly, rotation, sx, sy, shx, shy = _setup_pose(bone)
+    if ov:
+        lx += ov.get("x", 0)
+        ly += ov.get("y", 0)
+        rotation += ov.get("rotation", 0)
+        sx *= ov.get("scaleX", 1)
+        sy *= ov.get("scaleY", 1)
+        shx += ov.get("shearX", 0)
+        shy += ov.get("shearY", 0)
+    return (lx, ly, rotation, sx, sy, shx, shy)
 
 
 def solve_world_transforms(
@@ -414,61 +723,12 @@ def solve_world_transforms(
 
     for bone in bones:
         name = bone["name"]
-        lx = bone.get("x", 0.0)
-        ly = bone.get("y", 0.0)
-        rotation = bone.get("rotation", 0.0)
-        sx = bone.get("scaleX", 1.0)
-        sy = bone.get("scaleY", 1.0)
-        shear_x = bone.get("shearX", 0.0)
-        shear_y = bone.get("shearY", 0.0)
-
-        if bone_overrides and name in bone_overrides:
-            ov = bone_overrides[name]
-            lx += ov.get("x", 0)
-            ly += ov.get("y", 0)
-            rotation += ov.get("rotation", 0)
-            sx *= ov.get("scaleX", 1)
-            sy *= ov.get("scaleY", 1)
-            shear_x += ov.get("shearX", 0)
-            shear_y += ov.get("shearY", 0)
-
-        rot_rad = math.radians(rotation + 90 + shear_y)
-        cos_r = math.cos(math.radians(rotation))
-        sin_r = math.sin(math.radians(rotation))
-        cos_ry = math.cos(rot_rad)
-        sin_ry = math.sin(rot_rad)
-
-        la = cos_r * sx
-        lb = cos_ry * sy
-        lc = sin_r * sx
-        ld = sin_ry * sy
-
-        if shear_x != 0.0:
-            shx_rad = math.radians(shear_x)
-            cos_shx = math.cos(shx_rad)
-            sin_shx = math.sin(shx_rad)
-            la, lb = la + lb * sin_shx, lb * cos_shx
-            lc, ld = lc + ld * sin_shx, ld * cos_shx
-
-        bt = BoneTransform()
+        ov = bone_overrides.get(name) if bone_overrides else None
+        pose = _animated_pose(bone, ov)
         parent_name = bone.get("parent")
-
-        if parent_name and parent_name in world:
-            p = world[parent_name]
-            bt.worldX = p.a * lx + p.b * ly + p.worldX
-            bt.worldY = p.c * lx + p.d * ly + p.worldY
-            bt.a = p.a * la + p.b * lc
-            bt.b = p.a * lb + p.b * ld
-            bt.c = p.c * la + p.d * lc
-            bt.d = p.c * lb + p.d * ld
-        else:
-            bt.worldX = lx
-            bt.worldY = ly
-            bt.a = la
-            bt.b = lb
-            bt.c = lc
-            bt.d = ld
-
+        parent = world.get(parent_name) if parent_name else None
+        bt = BoneTransform()
+        _apply_local_pose(bt, parent, pose, _inherit_mode(bone))
         world[name] = bt
 
     return world
@@ -482,12 +742,21 @@ def solve_ik_constraints(
     bones: list[dict],
     world: dict[str, BoneTransform],
     constraints: list[dict],
+    bone_overrides: dict[str, dict] | None = None,
 ):
     """Apply IK constraints to world transforms in-place.
 
     Supports 1-bone and 2-bone IK. Constraints are processed in 'order' order.
+    The animated local pose is taken from ``world`` (stored by
+    ``solve_world_transforms``); ``bone_overrides`` is only needed for
+    transforms built by other means.
     """
     bone_map = {b["name"]: b for b in bones}
+    if bone_overrides:
+        for name, ov in bone_overrides.items():
+            bt = world.get(name)
+            if bt is not None and bt.pose is None and name in bone_map:
+                bt.pose = _animated_pose(bone_map[name], ov)
     sorted_constraints = sorted(constraints, key=lambda c: c.get("order", 0))
 
     for constraint in sorted_constraints:
@@ -509,47 +778,51 @@ def solve_ik_constraints(
                             tx, ty, mix, bend_positive)
 
 
+def _current_pose(bone_map, world, name) -> tuple:
+    """Current animated local pose of a bone (falls back to the setup pose)."""
+    bt = world.get(name)
+    if bt is not None and bt.pose is not None:
+        return bt.pose
+    return _setup_pose(bone_map.get(name, {}))
+
+
+def _to_parent_space(world, parent_name, tx, ty):
+    """Target (world) -> local space of the parent bone; None if singular."""
+    if parent_name and parent_name in world:
+        p = world[parent_name]
+        det = p.a * p.d - p.b * p.c
+        if abs(det) < 1e-10:
+            return None
+        inv_det = 1.0 / det
+        dx = tx - p.worldX
+        dy = ty - p.worldY
+        return ((dx * p.d - dy * p.b) * inv_det,
+                (dy * p.a - dx * p.c) * inv_det)
+    return tx, ty
+
+
+def _wrap180(angle: float) -> float:
+    return ((angle + 180.0) % 360.0) - 180.0
+
+
 def _apply_ik_1bone(bone_map, world, bone_name, tx, ty, mix):
     """Single-bone IK: rotate bone to point at target."""
     bt = world.get(bone_name)
     if bt is None:
         return
 
-    # Get parent inverse to find target in bone's local space
     bone_data = bone_map.get(bone_name, {})
-    parent_name = bone_data.get("parent")
+    local = _to_parent_space(world, bone_data.get("parent"), tx, ty)
+    if local is None:
+        return
+    local_tx, local_ty = local
 
-    if parent_name and parent_name in world:
-        p = world[parent_name]
-        # Inverse of parent world transform to get local target
-        det = p.a * p.d - p.b * p.c
-        if abs(det) < 1e-10:
-            return
-        inv_det = 1.0 / det
-        dx = tx - p.worldX
-        dy = ty - p.worldY
-        local_tx = (dx * p.d - dy * p.b) * inv_det
-        local_ty = (dy * p.a - dx * p.c) * inv_det
-    else:
-        local_tx = tx
-        local_ty = ty
+    bx, by, rotation, _sx, _sy, shear_x, _shy = _current_pose(bone_map, world, bone_name)
 
-    # Current bone local position
-    bx = bone_data.get("x", 0.0)
-    by = bone_data.get("y", 0.0)
-
-    # Angle from bone to target in local space
     target_angle = math.degrees(math.atan2(local_ty - by, local_tx - bx))
-    setup_rotation = bone_data.get("rotation", 0.0)
-    rotation_delta = target_angle - setup_rotation
+    delta = _wrap180(target_angle - shear_x - rotation)
+    final_rotation = rotation + delta * mix
 
-    # Normalize to -180..180
-    rotation_delta = ((rotation_delta + 180) % 360) - 180
-
-    # Apply mix
-    final_rotation = setup_rotation + rotation_delta * mix
-
-    # Recompute world transform with new rotation
     _recompute_bone_world(bone_map, world, bone_name, rotation_override=final_rotation)
 
 
@@ -564,80 +837,56 @@ def _apply_ik_2bone(bone_map, world, parent_name, child_name,
     parent_data = bone_map.get(parent_name, {})
     child_data = bone_map.get(child_name, {})
 
-    # Bone lengths from setup pose
-    cx_local = child_data.get("x", 0.0)
-    cy_local = child_data.get("y", 0.0)
-    child_len = math.sqrt(cx_local * cx_local + cy_local * cy_local)
-    if child_len < 1e-6:
+    px, py, p_rot, p_sx, p_sy, p_shx, _p_shy = _current_pose(bone_map, world, parent_name)
+    cx_local, cy_local = _current_pose(bone_map, world, child_name)[:2]
+
+    # l1: distance parent origin -> child origin (child offset scaled by the parent)
+    cxs = cx_local * p_sx
+    cys = cy_local * p_sy
+    l1 = math.sqrt(cxs * cxs + cys * cys)
+    if l1 < 1e-6:
         return
+    child_dir = math.atan2(cys, cxs)
 
-    # Parent bone length: distance from parent to child in world space
-    parent_len = child_len  # Use child's local offset as parent length
-
-    # Target distance from parent
-    dx = tx - parent_bt.worldX
-    dy = ty - parent_bt.worldY
-    target_dist = math.sqrt(dx * dx + dy * dy)
-
-    if target_dist < 1e-6:
-        return
-
-    # Clamp target distance to reachable range
-    l1 = parent_len
-    l2 = child_len  # grandchild or end effector — approximate
-
-    # For 2-bone IK, l1 = parent bone length, l2 = child bone length
-    # We need the child's effective length — use the distance from child to its end
-    # For simplicity, use local x offset of each bone
-    l1 = math.sqrt(cx_local * cx_local + cy_local * cy_local)
-
-    # Get grandchild data for l2 (length of child bone)
-    # Look for bones whose parent is child_name
-    l2 = 0.0
-    for b in bone_map.values():
-        if isinstance(b, dict) and b.get("parent") == child_name:
-            bx = b.get("x", 0.0)
-            by = b.get("y", 0.0)
-            d = math.sqrt(bx * bx + by * by)
-            if d > l2:
-                l2 = d
-    if l2 < 1e-6:
-        l2 = l1  # Fallback: assume equal length
-
-    # Get parent's parent for coordinate space
     pp_name = parent_data.get("parent")
+    pp = world.get(pp_name) if pp_name else None
 
-    # Target angle from parent
-    if pp_name and pp_name in world:
-        pp = world[pp_name]
-        det = pp.a * pp.d - pp.b * pp.c
-        if abs(det) < 1e-10:
-            return
-        inv_det = 1.0 / det
-        ddx = tx - pp.worldX
-        ddy = ty - pp.worldY
-        local_tx = (ddx * pp.d - ddy * pp.b) * inv_det
-        local_ty = (ddy * pp.a - ddx * pp.c) * inv_det
-    else:
-        local_tx = tx
-        local_ty = ty
+    # l2: length of the child bone in the same (grandparent) space
+    length = child_data.get("length", 0.0) or 0.0
+    l2 = 0.0
+    if length > 0:
+        pp_scale = math.hypot(pp.a, pp.c) if pp is not None else 1.0
+        if pp_scale < 1e-9:
+            pp_scale = 1.0
+        l2 = length * math.hypot(child_bt.a, child_bt.c) / pp_scale
+    if l2 < 1e-6:
+        # No usable length: longest offset of a grandchild, else equal lengths.
+        for b in bone_map.values():
+            if isinstance(b, dict) and b.get("parent") == child_name:
+                bx, by = b.get("x", 0.0), b.get("y", 0.0)
+                l2 = max(l2, math.sqrt(bx * bx + by * by))
+        if l2 < 1e-6:
+            l2 = l1
 
-    pbx = parent_data.get("x", 0.0)
-    pby = parent_data.get("y", 0.0)
-    ddx = local_tx - pbx
-    ddy = local_ty - pby
-    target_dist_local = math.sqrt(ddx * ddx + ddy * ddy)
+    local = _to_parent_space(world, pp_name, tx, ty)
+    if local is None:
+        return
+    local_tx, local_ty = local
+
+    ddx = local_tx - px
+    ddy = local_ty - py
+    dist = math.sqrt(ddx * ddx + ddy * ddy)
+    if dist < 1e-6:
+        return
     target_angle = math.atan2(ddy, ddx)
 
-    # Law of cosines for parent angle
-    cos_angle = (l1 * l1 + target_dist_local * target_dist_local - l2 * l2) / (2 * l1 * target_dist_local) if target_dist_local > 1e-6 else 1.0
+    cos_angle = (l1 * l1 + dist * dist - l2 * l2) / (2 * l1 * dist)
     cos_angle = max(-1.0, min(1.0, cos_angle))
     parent_ik_angle = target_angle + ((-1 if bend_positive else 1) * math.acos(cos_angle))
 
-    parent_setup_rot = parent_data.get("rotation", 0.0)
-    parent_new_rot = math.degrees(parent_ik_angle)
-    parent_delta = ((parent_new_rot - parent_setup_rot + 180) % 360) - 180
-    final_parent_rot = parent_setup_rot + parent_delta * mix
+    parent_new_rot = math.degrees(parent_ik_angle - child_dir) - p_shx
+    parent_delta = _wrap180(parent_new_rot - p_rot)
+    final_parent_rot = p_rot + parent_delta * mix
 
     _recompute_bone_world(bone_map, world, parent_name,
                           rotation_override=final_parent_rot)
@@ -647,36 +896,15 @@ def _apply_ik_2bone(bone_map, world, parent_name, child_name,
 
 
 def _recompute_bone_world(bone_map, world, bone_name, rotation_override=None):
-    """Recompute a single bone's world transform with an optional rotation override."""
+    """Recompute a bone's world transform (optionally with a new local rotation)
+    from its current animated pose, then all descendants."""
     bone = bone_map.get(bone_name)
     if bone is None:
         return
 
-    lx = bone.get("x", 0.0)
-    ly = bone.get("y", 0.0)
-    rotation = rotation_override if rotation_override is not None else bone.get("rotation", 0.0)
-    sx = bone.get("scaleX", 1.0)
-    sy = bone.get("scaleY", 1.0)
-    shear_x = bone.get("shearX", 0.0)
-    shear_y = bone.get("shearY", 0.0)
-
-    rot_rad = math.radians(rotation + 90 + shear_y)
-    cos_r = math.cos(math.radians(rotation))
-    sin_r = math.sin(math.radians(rotation))
-    cos_ry = math.cos(rot_rad)
-    sin_ry = math.sin(rot_rad)
-
-    la = cos_r * sx
-    lb = cos_ry * sy
-    lc = sin_r * sx
-    ld = sin_ry * sy
-
-    if shear_x != 0.0:
-        shx_rad = math.radians(shear_x)
-        cos_shx = math.cos(shx_rad)
-        sin_shx = math.sin(shx_rad)
-        la, lb = la + lb * sin_shx, lb * cos_shx
-        lc, ld = lc + ld * sin_shx, ld * cos_shx
+    pose = _current_pose(bone_map, world, bone_name)
+    if rotation_override is not None:
+        pose = (pose[0], pose[1], rotation_override) + tuple(pose[3:])
 
     bt = world.get(bone_name)
     if bt is None:
@@ -684,25 +912,12 @@ def _recompute_bone_world(bone_map, world, bone_name, rotation_override=None):
         world[bone_name] = bt
 
     parent_name = bone.get("parent")
-    if parent_name and parent_name in world:
-        p = world[parent_name]
-        bt.worldX = p.a * lx + p.b * ly + p.worldX
-        bt.worldY = p.c * lx + p.d * ly + p.worldY
-        bt.a = p.a * la + p.b * lc
-        bt.b = p.a * lb + p.b * ld
-        bt.c = p.c * la + p.d * lc
-        bt.d = p.c * lb + p.d * ld
-    else:
-        bt.worldX = lx
-        bt.worldY = ly
-        bt.a = la
-        bt.b = lb
-        bt.c = lc
-        bt.d = ld
+    parent = world.get(parent_name) if parent_name else None
+    _apply_local_pose(bt, parent, pose, _inherit_mode(bone))
 
-    # Recompute children
+    # Recompute children from their own (animated) poses
     for child_bone in bone_map.values():
-        if isinstance(child_bone, dict) and child_bone.get("parent") == bone.get("name"):
+        if isinstance(child_bone, dict) and child_bone.get("parent") == bone_name:
             _recompute_bone_world(bone_map, world, child_bone["name"])
 
 
@@ -710,16 +925,43 @@ def _recompute_bone_world(bone_map, world, bone_name, rotation_override=None):
 # Atlas Texture Loader
 # ==========================================================================
 
+def assign_texture_keys(items) -> dict:
+    """Map texture keys to values for atlas regions.
+
+    ``items``: iterable of (region_name, index, value).  Region names are used
+    verbatim.  When several regions share a name the plain name maps to the one
+    with the LOWEST index (what ``findRegion(name)`` returns); every indexed
+    region is additionally registered as ``name_<index>`` when that key is free.
+    """
+    groups: dict = {}
+    order = []
+    for name, index, value in items:
+        if name not in groups:
+            groups[name] = []
+            order.append(name)
+        groups[name].append((index, len(groups[name]), value))
+
+    result: dict = {}
+    for name in order:
+        best = min(groups[name], key=lambda t: (t[0], t[1]))
+        result[name] = best[2]
+    for name in order:
+        for index, _seq, value in groups[name]:
+            if isinstance(index, int) and index >= 0:
+                result.setdefault("%s_%d" % (name, index), value)
+    return result
+
+
 def load_atlas_textures(atlas_path: str) -> dict[str, QPixmap]:
     """Load all frames from a Spine atlas as individual QPixmaps."""
     pages = parse_spine_atlas(atlas_path)
     atlas_dir = os.path.dirname(atlas_path)
-    textures: dict[str, QPixmap] = {}
+    items = []
 
     def restore_trimmed_frame(frame: dict, cropped: QPixmap) -> QPixmap:
         """Restore a trimmed atlas region onto its original transparent canvas."""
-        orig_w = max(1, int(frame.get("orig_w", cropped.width())))
-        orig_h = max(1, int(frame.get("orig_h", cropped.height())))
+        orig_w = max(1, int(frame.get("orig_w") or cropped.width()))
+        orig_h = max(1, int(frame.get("orig_h") or cropped.height()))
         offset_x = int(frame.get("offset_x", 0))
         offset_y = int(frame.get("offset_y", 0))
         paste_y = max(0, orig_h - cropped.height() - offset_y)
@@ -760,6 +1002,7 @@ def load_atlas_textures(atlas_path: str) -> dict[str, QPixmap]:
                 continue
 
             if rotated:
+                # Stored rotated 90 deg CCW, occupying h x w: rotate back clockwise.
                 cropped = page_pixmap.copy(x, y, h, w)
                 xform = QTransform()
                 xform.rotate(90)
@@ -769,15 +1012,55 @@ def load_atlas_textures(atlas_path: str) -> dict[str, QPixmap]:
 
             cropped = restore_trimmed_frame(frame, cropped)
 
-            key = os.path.splitext(fname)[0] if "." in fname else fname
-            textures[key] = cropped
+            # Atlas region names have no extension: never strip anything.
+            items.append((fname, frame.get("index", -1), cropped))
 
-    return textures
+    return assign_texture_keys(items)
 
 
 # ==========================================================================
 # Build draw list from spine data
 # ==========================================================================
+
+def _find_attachment(skins: dict, slot_name: str, att_name: str, active_skin):
+    """(skin_name, attachment) of ``att_name`` in the slot, or (None, None).
+
+    With an active skin: that skin, then "default".  Without: "default", then
+    every skin.
+    """
+    if active_skin:
+        order = [active_skin] if active_skin == "default" else [active_skin, "default"]
+    else:
+        order = ["default"] + [n for n in skins if n != "default"]
+    for skin_name in order:
+        att = skins.get(skin_name, {}).get(slot_name, {}).get(att_name)
+        if att is not None:
+            return skin_name, att
+    return None, None
+
+
+def _resolve_slot_color(slot: dict, state: dict | None):
+    """Slot colour: setup colour overridden by animated colour / rgb / alpha."""
+    base = _color_to_floats(slot["color"]) if "color" in slot else None
+    if not state or not ("color" in state or "rgb" in state or "alpha" in state):
+        return base
+    r, g, b, a = state.get("color") or base or (1.0, 1.0, 1.0, 1.0)
+    rgb = state.get("rgb")
+    if rgb is not None:
+        r, g, b = rgb[0], rgb[1], rgb[2]
+    if state.get("alpha") is not None:
+        a = state["alpha"]
+    return (r, g, b, a)
+
+
+def _apply_deltas(setup_verts: list, deltas: list) -> list:
+    if len(deltas) >= len(setup_verts):
+        return [sv + dv for sv, dv in zip(setup_verts, deltas)]
+    out = list(setup_verts)
+    for i, dv in enumerate(deltas):
+        out[i] += dv
+    return out
+
 
 def build_draw_list(
     spine_data: dict,
@@ -792,7 +1075,8 @@ def build_draw_list(
 
     slot_states: per-slot animation overrides (attachment name, color).
     slot_order: reordered slot list from draw order timeline.
-    deform_states: {(slot_name, att_name): [vertex_deltas]} from deform timelines.
+    deform_states: {(slot_name, att_name): [vertex_deltas]} from deform timelines
+        (``(skin, slot, att)`` keys are preferred when present).
     active_skin: if set, search only this skin + "default" for attachments.
     """
     slots = slot_order if slot_order is not None else spine_data.get("slots", [])
@@ -805,6 +1089,19 @@ def build_draw_list(
         world_transforms.get(b.get("name")) for b in spine_data.get("bones", [])
     ]
 
+    def end_clip_if_pending(slot_name):
+        if slot_name in pending_clip_ends:
+            draw_list.append({"type": "clip_end_marker", "slot_name": slot_name})
+            pending_clip_ends.discard(slot_name)
+
+    def lookup_deform(skin_name, slot_name, att_name):
+        if not deform_states:
+            return None
+        for key in ((skin_name, slot_name, att_name), (slot_name, att_name)):
+            if key in deform_states:
+                return deform_states[key]
+        return None
+
     for slot in slots:
         slot_name = slot["name"]
         bone_name = slot["bone"]
@@ -813,69 +1110,26 @@ def build_draw_list(
 
         if state and "attachment" in state:
             att_name = state["attachment"]
-            if att_name is None:
-                if slot_name in pending_clip_ends:
-                    draw_list.append({"type": "clip_end_marker",
-                                      "slot_name": slot_name})
-                    pending_clip_ends.discard(slot_name)
-                continue  # Slot hidden by animation
         else:
             att_name = slot.get("attachment")
-            if att_name is None:
-                if slot_name in pending_clip_ends:
-                    draw_list.append({"type": "clip_end_marker",
-                                      "slot_name": slot_name})
-                    pending_clip_ends.discard(slot_name)
-                continue  # No attachment in setup pose — slot is empty
+        if att_name is None:
+            end_clip_if_pending(slot_name)
+            continue  # Slot hidden / empty
 
-        # Resolve slot color: animation overrides setup pose
-        if state and "color" in state:
-            color = state["color"]
-        elif "color" in slot:
-            color = _color_to_floats(slot["color"])
-        else:
-            color = None
-
+        color = _resolve_slot_color(slot, state)
         blend = slot.get("blend", "normal")
 
-        # Search skins for this attachment
-        att_data = None
-        if active_skin:
-            # Active skin first, then default as fallback
-            search_order = [active_skin, "default"] if active_skin != "default" else ["default"]
-            for skin_name in search_order:
-                skin = skins.get(skin_name, {})
-                slot_atts = skin.get(slot_name, {})
-                if att_name in slot_atts:
-                    att_data = slot_atts[att_name]
-                    break
-        else:
-            # Original behavior: default first, then all skins
-            for skin_name in ("default",):
-                skin = skins.get(skin_name, {})
-                slot_atts = skin.get(slot_name, {})
-                if att_name in slot_atts:
-                    att_data = slot_atts[att_name]
-                    break
-
-            if att_data is None:
-                for skin_name, skin in skins.items():
-                    slot_atts = skin.get(slot_name, {})
-                    if att_name in slot_atts:
-                        att_data = slot_atts[att_name]
-                        break
-
+        skin_found, att_data = _find_attachment(skins, slot_name, att_name, active_skin)
         if att_data is None:
-            att_data = {}
+            # Not in the active skin nor in default: nothing to draw.
+            end_clip_if_pending(slot_name)
+            continue
 
         att_type = att_data.get("type")
 
         # Handle clipping attachments
         if att_type == "clipping":
-            if slot_name in pending_clip_ends:
-                draw_list.append({"type": "clip_end_marker",
-                                  "slot_name": slot_name})
-                pending_clip_ends.discard(slot_name)
+            end_clip_if_pending(slot_name)
             setup_verts = att_data.get("vertices", [])
             weighted = mesh_is_weighted(
                 setup_verts, att_data.get("vertexCount", 0))
@@ -883,12 +1137,9 @@ def build_draw_list(
                 # Weighted clip: decode to world space (deform not applied).
                 final_verts = resolve_weighted_vertices(setup_verts, bone_tx_list)
             else:
-                deform_key = (slot_name, att_name)
-                if deform_states and deform_key in deform_states:
-                    deltas = deform_states[deform_key]
-                    final_verts = [sv + dv for sv, dv in zip(setup_verts, deltas)]
-                else:
-                    final_verts = list(setup_verts)
+                deltas = lookup_deform(skin_found, slot_name, att_name)
+                final_verts = (_apply_deltas(setup_verts, deltas)
+                               if deltas is not None else list(setup_verts))
             clip_end_slot = att_data.get("end", "")
             if clip_end_slot:
                 pending_clip_ends.add(clip_end_slot)
@@ -902,9 +1153,21 @@ def build_draw_list(
             })
             continue
 
-        if att_type == "mesh":
-            setup_verts = att_data.get("vertices", [])
-            uvs = att_data.get("uvs", [])
+        if att_type in ("mesh", "linkedmesh"):
+            geom = att_data
+            geom_skin, geom_name = skin_found, att_name
+            inherit_deform = False
+            if att_type == "linkedmesh":
+                res = _resolve_linked_mesh(skins, skin_found, slot_name, att_data)
+                if res is None:
+                    end_clip_if_pending(slot_name)
+                    continue
+                geom_skin, geom_name, geom = res
+                inherit_deform = (att_data.get("timelines", att_data.get("deform", True))
+                                  is not False)
+
+            setup_verts = geom.get("vertices", [])
+            uvs = geom.get("uvs", [])
             weighted = mesh_is_weighted(setup_verts, len(uvs) // 2)
             if weighted:
                 # Weighted (bone-rigged) mesh: decode to world space. The
@@ -912,16 +1175,16 @@ def build_draw_list(
                 # deform deltas are not applied here.
                 final_verts = resolve_weighted_vertices(setup_verts, bone_tx_list)
             else:
-                deform_key = (slot_name, att_name)
-                if deform_states and deform_key in deform_states:
-                    deltas = deform_states[deform_key]
-                    final_verts = [sv + dv for sv, dv in zip(setup_verts, deltas)]
-                else:
-                    final_verts = list(setup_verts)
+                deltas = lookup_deform(skin_found, slot_name, att_name)
+                if deltas is None and inherit_deform:
+                    deltas = lookup_deform(geom_skin, slot_name, geom_name)
+                final_verts = (_apply_deltas(setup_verts, deltas)
+                               if deltas is not None else list(setup_verts))
 
             image_key = attachment_image_key(att_name, att_data)
             pixmap = textures.get(image_key)
             if pixmap is None:
+                end_clip_if_pending(slot_name)
                 continue
 
             draw_list.append({
@@ -931,31 +1194,22 @@ def build_draw_list(
                 "vertices": final_verts,
                 "world_space": weighted,
                 "uvs": uvs,
-                "triangles": att_data.get("triangles", []),
+                "triangles": geom.get("triangles", []),
                 "pixmap": pixmap,
                 "color": color,
                 "blend": blend,
             })
-            if slot_name in pending_clip_ends:
-                draw_list.append({"type": "clip_end_marker",
-                                  "slot_name": slot_name})
-                pending_clip_ends.discard(slot_name)
+            end_clip_if_pending(slot_name)
             continue
 
         if att_type is not None and att_type != "region":
-            if slot_name in pending_clip_ends:
-                draw_list.append({"type": "clip_end_marker",
-                                  "slot_name": slot_name})
-                pending_clip_ends.discard(slot_name)
+            end_clip_if_pending(slot_name)
             continue
 
         image_key = attachment_image_key(att_name, att_data)
         pixmap = textures.get(image_key)
         if pixmap is None:
-            if slot_name in pending_clip_ends:
-                draw_list.append({"type": "clip_end_marker",
-                                  "slot_name": slot_name})
-                pending_clip_ends.discard(slot_name)
+            end_clip_if_pending(slot_name)
             continue
 
         draw_list.append({
@@ -970,8 +1224,6 @@ def build_draw_list(
         if slot_name in pending_clip_ends and clip_end_marker_after_slot(
             att_name, att_data,
         ):
-            draw_list.append({"type": "clip_end_marker",
-                              "slot_name": slot_name})
-            pending_clip_ends.discard(slot_name)
+            end_clip_if_pending(slot_name)
 
     return draw_list

@@ -1,5 +1,7 @@
 """Tab with ready-to-copy settings for connecting Claude (MCP) to this app."""
 
+from __future__ import annotations
+
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton,
     QTabWidget, QApplication,

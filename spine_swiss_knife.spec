@@ -6,6 +6,28 @@ import re
 
 block_cipher = None
 
+# Pure-logic modules (no PySide6): needed by the headless API / CLI / MCP.
+_PURE_MODULES = [
+    'spine_swiss_knife.' + m for m in (
+        'atlas_parser',
+        'spine_json',
+        'spine_refs',
+        'spine_validate',
+        'spine_cli',
+        'dead_bones_core',
+        'downscale_core',
+        'draw_order_core',
+        'flatten_core',
+        'hidden_attachments_core',
+        'keyframe_core',
+        'mask_core',
+        'merge_core',
+        'splitter_core',
+        'static_exporter_core',
+        'unused_core',
+    )
+]
+
 # Read version dynamically
 with open('spine_swiss_knife/__init__.py') as _f:
     _VERSION = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', _f.read()).group(1)
@@ -21,7 +43,8 @@ a = Analysis(
     ],
     hiddenimports=['certifi', 'numpy', 'PIL',
                    'spine_swiss_knife.api', 'spine_swiss_knife.cli',
-                   'spine_swiss_knife.mcp_server', 'spine_swiss_knife.launcher'],
+                   'spine_swiss_knife.mcp_server', 'spine_swiss_knife.launcher']
+                  + _PURE_MODULES,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -40,8 +63,8 @@ mcp_a = Analysis(
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=['PIL', 'spine_swiss_knife.api', 'spine_swiss_knife.cli',
-                   'spine_swiss_knife.mcp_server'],
+    hiddenimports=['PIL', 'numpy', 'spine_swiss_knife.api', 'spine_swiss_knife.cli',
+                   'spine_swiss_knife.mcp_server'] + _PURE_MODULES,
     hookspath=[],
     excludes=['PySide6', 'tkinter'],
     cipher=block_cipher,

@@ -6,3 +6,8 @@ dist/
 build/
 .DS_Store
 *.backup
+_ssk_backups/
+_ssk_export_*/
+_static_*/
+.venv/
+venv/

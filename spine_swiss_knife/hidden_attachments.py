@@ -1,7 +1,8 @@
 """Hidden Attachments tab — detect & fix invisible GPU waste from alpha=0 slots."""
 
+from __future__ import annotations
+
 import os
-import shutil
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -10,216 +11,11 @@ from PySide6.QtWidgets import (
 )
 
 from .i18n import tr, language_changed
-from .spine_json import load_spine_json, save_spine_json
-
-
-# ==========================================================================
-# Analysis logic
-# ==========================================================================
-
-def _build_bone_maps(spine_data):
-    """Return (children_map, bone_dict_map)."""
-    children = {}
-    bone_map = {}
-    for bone in spine_data.get("bones", []):
-        name = bone["name"]
-        bone_map[name] = bone
-        children.setdefault(name, [])
-        parent = bone.get("parent")
-        if parent is not None:
-            children.setdefault(parent, [])
-            children[parent].append(name)
-    return children, bone_map
-
-
-def _find_zero_scale_bones(bone_map):
-    """Return set of bone names where scaleX == 0 or scaleY == 0."""
-    result = set()
-    for name, bone in bone_map.items():
-        if bone.get("scaleX", 1) == 0 or bone.get("scaleY", 1) == 0:
-            result.add(name)
-    return result
-
-
-def _collect_descendants(bone_name, children_map):
-    """Return set of bone_name and all its descendants."""
-    result = {bone_name}
-    for child in children_map.get(bone_name, []):
-        result |= _collect_descendants(child, children_map)
-    return result
-
-
-def _alpha_from_hex(color_hex):
-    """Extract alpha (0-255) from an 8-char hex color string."""
-    color_hex = str(color_hex)
-    if len(color_hex) >= 8:
-        return int(color_hex[6:8], 16)
-    return 255
-
-
-def analyze_hidden_attachments(spine_data):
-    """Detect slots with active attachments that are invisible.
-
-    Returns (candidates, anim_details, warnings).
-
-    candidates — list of {slot_name, original_attachment, bone_name, reason, ...}
-    anim_details — list of {animation, slot_name, action}
-    warnings — list of mid-animation alpha-to-zero without attachment null
-    """
-    children_map, bone_map = _build_bone_maps(spine_data)
-    zero_scale_bones = _find_zero_scale_bones(bone_map)
-
-    # Collect all bone names under zero-scale bones
-    zero_scale_all = set()
-    for zb in zero_scale_bones:
-        zero_scale_all |= _collect_descendants(zb, children_map)
-
-    # ── Phase 1: find candidates ──
-    candidates = []
-    for slot in spine_data.get("slots", []):
-        slot_name = slot["name"]
-        attachment = slot.get("attachment")
-        if attachment is None:
-            continue
-
-        bone_name = slot.get("bone", "")
-        color = slot.get("color", "ffffffff")
-        alpha = _alpha_from_hex(color)
-
-        reason = None
-        zero_bone = None
-        if alpha == 0:
-            reason = "alpha_zero"
-        elif bone_name in zero_scale_all:
-            ancestor = bone_name
-            while ancestor and ancestor not in zero_scale_bones:
-                ancestor = bone_map.get(ancestor, {}).get("parent")
-            reason = "bone_scale_zero"
-            zero_bone = ancestor or bone_name
-
-        if reason is None:
-            continue
-
-        cand = {
-            "slot_name": slot_name,
-            "original_attachment": attachment,
-            "bone_name": bone_name,
-            "reason": reason,
-        }
-        if zero_bone:
-            cand["zero_scale_bone"] = zero_bone
-        candidates.append(cand)
-
-    # ── Phase 2: classify candidate × animation ──
-    animations = spine_data.get("animations", {})
-    anim_details = []
-
-    for cand in candidates:
-        slot_name = cand["slot_name"]
-        anims_affected = []
-
-        for anim_name, anim_data in animations.items():
-            slot_tl = anim_data.get("slots", {}).get(slot_name, {})
-
-            # Check color timeline for alpha > 0
-            color_keys = slot_tl.get("color") or slot_tl.get("rgba") or []
-            alpha_goes_visible = False
-            for kf in color_keys:
-                c = kf.get("color", kf.get("rgba", "ffffffff"))
-                if _alpha_from_hex(c) > 0:
-                    alpha_goes_visible = True
-                    break
-
-            if not alpha_goes_visible:
-                continue  # always_hidden in this animation
-
-            att_keys = slot_tl.get("attachment")
-            action = "already_ok" if att_keys else "insert_kf"
-
-            anim_details.append({
-                "animation": anim_name,
-                "slot_name": slot_name,
-                "action": action,
-            })
-            anims_affected.append(anim_name)
-
-        cand["anims_affected"] = anims_affected
-
-    # ── Phase 3: mid-animation warnings (all slots) ──
-    warnings = []
-    for anim_name, anim_data in animations.items():
-        for slot_name, timelines in anim_data.get("slots", {}).items():
-            color_keys = timelines.get("color") or timelines.get("rgba") or []
-            att_keys = timelines.get("attachment") or []
-
-            for kf in color_keys:
-                t = kf.get("time", 0)
-                if t == 0:
-                    continue
-                c = kf.get("color", kf.get("rgba", "ffffffff"))
-                if _alpha_from_hex(c) > 0:
-                    continue
-                # Alpha goes to 0 mid-animation — check for attachment null nearby
-                has_null = any(
-                    ak.get("name") is None and abs(ak.get("time", 0) - t) < 0.001
-                    for ak in att_keys
-                )
-                if not has_null:
-                    warnings.append({
-                        "animation": anim_name,
-                        "slot_name": slot_name,
-                        "time": t,
-                    })
-
-    return candidates, anim_details, warnings
-
-
-def fix_hidden_attachments(spine_data, candidates, anim_details):
-    """Apply fixes: null setup-pose attachments, insert animation keyframes.
-
-    Returns (slots_fixed, keyframes_inserted).
-    """
-    candidate_names = {c["slot_name"] for c in candidates}
-    candidate_att = {c["slot_name"]: c["original_attachment"] for c in candidates}
-
-    # Fix setup pose
-    slots_fixed = 0
-    for slot in spine_data.get("slots", []):
-        if slot["name"] in candidate_names and slot.get("attachment") is not None:
-            slot["attachment"] = None
-            slots_fixed += 1
-
-    # Insert animation keyframes
-    keyframes_inserted = 0
-    animations = spine_data.get("animations", {})
-
-    for detail in anim_details:
-        if detail["action"] != "insert_kf":
-            continue
-
-        anim_name = detail["animation"]
-        slot_name = detail["slot_name"]
-        original = candidate_att.get(slot_name)
-        if original is None:
-            continue
-
-        anim_data = animations.get(anim_name)
-        if anim_data is None:
-            continue
-
-        if "slots" not in anim_data:
-            anim_data["slots"] = {}
-        if slot_name not in anim_data["slots"]:
-            anim_data["slots"][slot_name] = {}
-
-        slot_tl = anim_data["slots"][slot_name]
-        if "attachment" not in slot_tl:
-            slot_tl["attachment"] = []
-
-        slot_tl["attachment"].insert(0, {"time": 0, "name": original})
-        keyframes_inserted += 1
-
-    return slots_fixed, keyframes_inserted
+from .spine_json import load_spine_json, save_spine_json, create_backup
+from .hidden_attachments_core import (  # noqa: F401  (re-exported)
+    analyze_hidden_attachments, fix_hidden_attachments,
+    _build_bone_maps, _find_zero_scale_bones, _collect_descendants, _alpha_from_hex,
+)
 
 
 # ==========================================================================
@@ -401,7 +197,7 @@ class HiddenAttachmentsTab:
             return
 
         try:
-            shutil.copy2(json_path, backup_path)
+            create_backup(json_path)
             spine_data = load_spine_json(json_path)
         except Exception as e:
             QMessageBox.critical(None, tr("err.title"), tr("err.load_backup", error=e))

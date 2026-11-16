@@ -1,7 +1,8 @@
 """Blend Switcher tab — detect and fix problematic blend modes (multiply/screen)."""
 
+from __future__ import annotations
+
 import os
-import shutil
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -10,7 +11,7 @@ from PySide6.QtWidgets import (
 )
 
 from .i18n import tr, language_changed
-from .spine_json import load_spine_json, save_spine_json
+from .spine_json import load_spine_json, save_spine_json, create_backup
 from .slot_renamer import apply_renames, _strip_blend_suffix
 
 
@@ -30,6 +31,58 @@ def analyze_blend_modes(spine_data: dict) -> list[dict]:
                 "blend": blend,
             })
     return results
+
+
+def _renames_with_collisions_dropped(spine_data: dict, candidates: dict):
+    """Split *candidates* (old -> new) into a collision-free rename map and
+    the list of old names whose rename was dropped (slot keeps its name).
+
+    The rename is simultaneous, so chains and swaps stay legal. Dropping a
+    rename can create a new collision, hence the fixpoint loop.
+    """
+    cand = dict(candidates)
+    dropped = []
+    names = [s.get("name") for s in spine_data.get("slots") or []
+             if isinstance(s, dict)]
+    while True:
+        final = [cand.get(n, n) for n in names]
+        counts = {}
+        for n in final:
+            counts[n] = counts.get(n, 0) + 1
+        bad = [old for old, new in cand.items() if counts.get(new, 0) > 1]
+        if not bad:
+            return cand, dropped
+        for old in bad:
+            del cand[old]
+            dropped.append(old)
+
+
+def switch_blend_modes(spine_data: dict, names, target_blend: str):
+    """Switch multiply/screen slots in *names* to *target_blend* in place.
+
+    Each switched slot is also renamed (old blend suffix replaced by
+    ``_<target>``) with every reference updated; when the new name would
+    collide with another slot the blend still changes but the name is kept.
+    Returns ``(switched_count, kept_old_names)``.
+    """
+    switch_set = set(names)
+    switched = 0
+    candidates = {}
+    for slot in spine_data.get("slots", []):
+        if slot.get("name") in switch_set and slot.get("blend") in ("multiply", "screen"):
+            old_name = slot["name"]
+            if target_blend == "normal":
+                del slot["blend"]  # normal is default, no key needed
+            else:
+                slot["blend"] = target_blend
+            new_name = f"{_strip_blend_suffix(old_name)}_{target_blend}"
+            if new_name != old_name:
+                candidates[old_name] = new_name
+            switched += 1
+    rename_map, kept = _renames_with_collisions_dropped(spine_data, candidates)
+    if rename_map:
+        apply_renames(spine_data, rename_map)
+    return switched, kept
 
 
 # ==========================================================================
@@ -171,47 +224,34 @@ class BlendSwitcherTab:
 
         if QMessageBox.question(
             None, tr("confirm.title"),
-            tr("blend.confirm", count=len(checked_names), target=target_blend, backup=backup_path),
+            tr("blend.confirm_renames", count=len(checked_names),
+               target=target_blend, backup=backup_path),
         ) != QMessageBox.Yes:
             return
 
         try:
-            shutil.copy2(json_path, backup_path)
             spine_data = load_spine_json(json_path)
         except Exception as e:
             QMessageBox.critical(None, tr("err.title"), tr("err.load_backup", error=e))
             return
 
-        switch_set = set(checked_names)
-        switched = 0
-        rename_map = {}
-        for slot in spine_data.get("slots", []):
-            if slot.get("name") in switch_set and slot.get("blend") in ("multiply", "screen"):
-                old_name = slot["name"]
-                if target_blend == "normal":
-                    del slot["blend"]  # normal is default, no key needed
-                else:
-                    slot["blend"] = target_blend
-                # Rename slot: strip old blend suffix, add new one
-                base = _strip_blend_suffix(old_name)
-                new_name = f"{base}_{target_blend}"
-                if new_name != old_name:
-                    slot["name"] = new_name
-                    rename_map[old_name] = new_name
-                switched += 1
-        # Update all slot references (skins, animations, clipping, etc.)
-        if rename_map:
-            apply_renames(spine_data, rename_map)
-
         try:
+            switched, kept = switch_blend_modes(
+                spine_data, checked_names, target_blend)
+            create_backup(json_path)
             save_spine_json(json_path, spine_data)
         except Exception as e:
             QMessageBox.critical(None, tr("err.title"), tr("err.save_json", error=e))
             return
 
-        QMessageBox.information(
-            None, tr("done.title"),
-            tr("blend.done", count=switched, target=target_blend, backup=backup_path))
+        if kept:
+            message = tr("blend.done_kept", count=switched, target=target_blend,
+                         backup=backup_path, kept=len(kept),
+                         names=", ".join(sorted(kept)))
+        else:
+            message = tr("blend.done", count=switched, target=target_blend,
+                         backup=backup_path)
+        QMessageBox.information(None, tr("done.title"), message)
         if self._on_modified:
             self._on_modified()
         else:

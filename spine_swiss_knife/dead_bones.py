@@ -1,7 +1,8 @@
 """Dead Bones tab — detect bones that serve no purpose and add runtime overhead."""
 
+from __future__ import annotations
+
 import os
-import shutil
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -10,125 +11,11 @@ from PySide6.QtWidgets import (
 )
 
 from .i18n import tr, language_changed
-from .spine_json import load_spine_json, save_spine_json
-
-
-# ==========================================================================
-# Analysis logic (unchanged)
-# ==========================================================================
-
-def _collect_bone_references(spine_data: dict) -> dict:
-    refs = {}
-
-    def _ensure(name):
-        if name not in refs:
-            refs[name] = {"has_slots": False, "has_animation": False, "has_constraint": False}
-
-    for slot in spine_data.get("slots", []):
-        bone_name = slot.get("bone")
-        if bone_name:
-            _ensure(bone_name)
-            refs[bone_name]["has_slots"] = True
-
-    for anim_name, anim_data in spine_data.get("animations", {}).items():
-        for bone_name in anim_data.get("bones", {}):
-            _ensure(bone_name)
-            refs[bone_name]["has_animation"] = True
-
-    for ik in spine_data.get("ik", []):
-        for bone_name in ik.get("bones", []):
-            _ensure(bone_name)
-            refs[bone_name]["has_constraint"] = True
-        target = ik.get("target")
-        if target:
-            _ensure(target)
-            refs[target]["has_constraint"] = True
-
-    for tc in spine_data.get("transform", []):
-        for bone_name in tc.get("bones", []):
-            _ensure(bone_name)
-            refs[bone_name]["has_constraint"] = True
-        target = tc.get("target")
-        if target:
-            _ensure(target)
-            refs[target]["has_constraint"] = True
-
-    for pc in spine_data.get("path", []):
-        bones_field = pc.get("bones")
-        if isinstance(bones_field, list):
-            for bone_name in bones_field:
-                _ensure(bone_name)
-                refs[bone_name]["has_constraint"] = True
-        elif isinstance(bones_field, str):
-            _ensure(bones_field)
-            refs[bones_field]["has_constraint"] = True
-
-    return refs
-
-
-def analyze_dead_bones(spine_data):
-    bones = spine_data.get("bones", [])
-    if not bones:
-        return [], []
-
-    bone_names = []
-    bone_parent = {}
-    children_map = {}
-
-    for bone in bones:
-        name = bone["name"]
-        parent = bone.get("parent")
-        bone_names.append(name)
-        bone_parent[name] = parent
-        children_map.setdefault(name, [])
-        if parent is not None:
-            children_map.setdefault(parent, [])
-            children_map[parent].append(name)
-
-    refs = _collect_bone_references(spine_data)
-
-    alive_set = set()
-    alive_reasons = {}
-
-    def _mark_alive(name):
-        if name in alive_set:
-            return True
-        reasons = []
-        r = refs.get(name, {"has_slots": False, "has_animation": False, "has_constraint": False})
-        if r["has_slots"]:
-            reasons.append("has_slots")
-        if r["has_animation"]:
-            reasons.append("has_animation")
-        if r["has_constraint"]:
-            reasons.append("has_constraint")
-        has_alive_child = False
-        for child in children_map.get(name, []):
-            if _mark_alive(child):
-                has_alive_child = True
-        if has_alive_child:
-            reasons.append("has_alive_child")
-        if reasons:
-            alive_set.add(name)
-            alive_reasons[name] = reasons
-            return True
-        return False
-
-    for name in bone_names:
-        if bone_parent[name] is None:
-            _mark_alive(name)
-    for name in bone_names:
-        if name not in alive_set:
-            _mark_alive(name)
-
-    dead_list = []
-    alive_list = []
-    for name in bone_names:
-        parent = bone_parent[name] or ""
-        if name in alive_set:
-            alive_list.append({"name": name, "parent": parent, "reasons": ", ".join(alive_reasons[name])})
-        else:
-            dead_list.append({"name": name, "parent": parent, "reason": "No slots, animations, or constraints"})
-    return dead_list, alive_list
+from .spine_json import load_spine_json, save_spine_json, create_backup
+from .spine_refs import remove_bones
+from .dead_bones_core import (  # noqa: F401  (re-exported)
+    analyze_dead_bones, filter_removable_selection,
+)
 
 
 # ==========================================================================
@@ -259,25 +146,32 @@ class DeadBonesTab:
             return
 
         backup_path = json_path + ".backup"
+        try:
+            spine_data = load_spine_json(json_path)
+        except Exception as e:
+            QMessageBox.critical(None, tr("err.title"), tr("err.parse_json", error=e))
+            return
+        keep, skipped = filter_removable_selection(spine_data, checked_names)
+        if not keep:
+            QMessageBox.warning(None, tr("err.title"),
+                                tr("dead.skipped", count=len(skipped)))
+            return
+
         if QMessageBox.question(
             None, tr("confirm.title"),
-            tr("dead.confirm", count=len(checked_names), backup=backup_path),
+            tr("dead.confirm", count=len(keep), backup=backup_path)
+            + ("\n\n" + tr("dead.skipped", count=len(skipped)) if skipped else ""),
         ) != QMessageBox.Yes:
             return
 
         try:
-            shutil.copy2(json_path, backup_path)
-            spine_data = load_spine_json(json_path)
-        except Exception as e:
-            QMessageBox.critical(None, tr("err.title"), tr("err.load_backup", error=e))
+            removed = remove_bones(spine_data, keep)
+        except ValueError as e:
+            QMessageBox.critical(None, tr("err.title"), str(e))
             return
 
-        dead_set = set(checked_names)
-        original_count = len(spine_data.get("bones", []))
-        spine_data["bones"] = [b for b in spine_data.get("bones", []) if b["name"] not in dead_set]
-        removed = original_count - len(spine_data["bones"])
-
         try:
+            create_backup(json_path)
             save_spine_json(json_path, spine_data)
         except Exception as e:
             QMessageBox.critical(None, tr("err.title"), tr("err.save_json", error=e))

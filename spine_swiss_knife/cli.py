@@ -28,6 +28,10 @@ def _build_parser() -> argparse.ArgumentParser:
             if "bool" in hint:
                 sp.add_argument(flag, dest=pname, action=argparse.BooleanOptionalAction,
                                 default=p.default)
+            elif "float" in hint:
+                sp.add_argument(flag, dest=pname, type=float,
+                                default=None if required else p.default,
+                                required=required)
             elif "int" in hint:
                 sp.add_argument(flag, dest=pname, type=int,
                                 default=None if required else p.default,
@@ -48,6 +52,10 @@ def main(argv=None) -> int:
         result = api.TOOLS[tool](**args)
     except api.SpineError as e:
         print(json.dumps({"error": str(e)}), file=sys.stdout)
+        return 1
+    except Exception as e:  # never show a traceback to CLI users
+        print(json.dumps({"error": str(e), "type": type(e).__name__}),
+              file=sys.stdout)
         return 1
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0

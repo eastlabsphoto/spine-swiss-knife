@@ -1,5 +1,7 @@
 """Dark theme stylesheet and color constants for GreentubeSK Spine Swiss Knife."""
 
+from __future__ import annotations
+
 import os as _os
 
 _ARROW_PATH = _os.path.join(_os.path.dirname(__file__), "resources", "arrow_down.png").replace("\\", "/")
