@@ -229,50 +229,11 @@ def fix_attachment_name(json_path: str, old: str, new: str,
 # export_static (first frame + optional blur)
 # ---------------------------------------------------------------------------
 
-def export_static(spine_file: str, animation: str, out_dir: str,
-                  skeleton: Optional[str] = None, name: Optional[str] = None,
-                  mode: str = "trim", canvas_width: int = 0,
-                  canvas_height: int = 0, padding: int = 0,
-                  blur_radius: int = 0, blur_extra_pad: int = 0,
-                  blur_canvas_width: int = 0, blur_canvas_height: int = 0,
-                  skin: Optional[str] = None,
-                  spine_exe: Optional[str] = None) -> dict:
-    """Export frame 0 of an animation as PNG, optionally plus a blur variant.
-
-    mode: ``trim``   - crop to content (alpha bbox);
-          ``center`` - keep the Spine origin at the image centre (origin is
-                       the centre of the exported canvas, so a symbol placed
-                       at 0,0 lines up with the spine entity);
-          ``fixed``  - exact canvas_width x canvas_height, origin centred.
-    skin: skin name to render (e.g. ``default``); omit for the editor's
-          current skin (may differ, e.g. a numbered variant).
-    blur_radius > 0 also writes ``<name>_blur.png`` (vertical motion blur).
-    """
+def _spine_png(spine_file: str, settings: dict, spine_exe: Optional[str]):
+    """Run one Spine PNG export, return the first frame as a PIL image."""
     from PIL import Image
-    from .static_exporter_core import (DEFAULT_EXPORT_SETTINGS,
-                                       _create_blur_variants,
-                                       _normalize_canvas)
-    _require_file(spine_file, "Spine project")
-    if mode not in ("trim", "center", "fixed"):
-        raise SpineError("mode must be trim, center or fixed")
-    if mode == "fixed" and not (canvas_width and canvas_height):
-        raise SpineError("mode=fixed needs canvas_width and canvas_height")
-
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    stem = name or (f"{skeleton or Path(spine_file).stem}_{animation}")
-
-    settings = dict(DEFAULT_EXPORT_SETTINGS)
-    settings.update({"animationType": "single", "animation": animation,
-                     "fps": 1, "lastFrame": False, "background": None})
-    if skin:
-        settings["skinType"] = "single"
-        settings["skinNone"] = False
-        settings["skin"] = skin
-    if skeleton:
-        settings["skeletonType"] = "single"
-        settings["skeleton"] = skeleton
     tmp_dir = Path(tempfile.mkdtemp(prefix="ssk_static_"))
+    settings = dict(settings)
     settings["output"] = str(tmp_dir.resolve())
     settings["open"] = False
     tmp = _write_json_tmp(settings)
@@ -286,30 +247,94 @@ def export_static(spine_file: str, animation: str, out_dir: str,
         frames = sorted(tmp_dir.rglob("*.png"))
         if not frames:
             raise SpineError("Spine produced no PNG (check skeleton/animation).")
-        dst = out / f"{stem}.png"
-        shutil.copyfile(frames[0], dst)
+        img = Image.open(frames[0]).convert("RGBA")
+        img.load()
+        return img
     finally:
         Path(tmp).unlink(missing_ok=True)
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    paths = {stem: str(dst)}
-    if mode == "trim":
-        _normalize_canvas(paths, "rect", padding, False)
-    elif mode == "center":
-        _normalize_canvas(paths, "rect", padding, True)
-    else:
-        _normalize_canvas(paths, "rect", padding, True,
-                          fixed_size=(canvas_width, canvas_height))
 
-    result = {"static": str(dst), "size": list(Image.open(dst).size),
-              "mode": mode}
+def export_static(spine_file: str, animation: str, out_dir: str,
+                  skeleton: Optional[str] = None, name: Optional[str] = None,
+                  mode: str = "trim", canvas_width: int = 0,
+                  canvas_height: int = 0, padding: int = 0,
+                  blur_radius: int = 0, blur_extra_pad: int = 0,
+                  blur_canvas_width: int = 0, blur_canvas_height: int = 0,
+                  spine_exe: Optional[str] = None) -> dict:
+    """Export frame 0 of an animation as PNG, optionally plus a blur variant.
+
+    mode: ``trim``   - crop to content (alpha bbox);
+          ``center`` - symmetric canvas around the Spine origin, so a symbol
+                       placed at 0,0 lines up with the spine entity;
+          ``fixed``  - exact canvas_width x canvas_height, origin centred.
+    blur_radius > 0 also writes ``<name>_blur.png`` (vertical motion blur).
+
+    Pixels come from Spine's automatic-bounds export. For center/fixed a
+    second export with a crop box centred on the origin is used only to
+    measure where the origin is (the crop-box render is not used for pixels).
+    """
+    from PIL import Image
+    from .static_exporter_core import _create_blur_variants
+    _require_file(spine_file, "Spine project")
+    if mode not in ("trim", "center", "fixed"):
+        raise SpineError("mode must be trim, center or fixed")
+    if mode == "fixed" and not (canvas_width and canvas_height):
+        raise SpineError("mode=fixed needs canvas_width and canvas_height")
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    stem = name or (f"{skeleton or Path(spine_file).stem}_{animation}")
+
+    base = {"class": "export-png", "exportType": "animation",
+            "animation": animation, "fps": 1}
+    if skeleton:
+        base["skeleton"] = skeleton
+    img = _spine_png(spine_file, base, spine_exe)
+    bbox = img.getbbox()
+    if bbox is None:
+        raise SpineError("Exported frame is fully transparent.")
+    content = img.crop(bbox)
+
+    if mode == "trim":
+        canvas = Image.new("RGBA", (content.width + 2 * padding,
+                                    content.height + 2 * padding), (0, 0, 0, 0))
+        canvas.paste(content, (padding, padding))
+    else:
+        ref = _spine_png(spine_file, dict(base, cropX=-1000, cropY=-1000,
+                                          cropWidth=2000, cropHeight=2000),
+                         spine_exe)
+        rb = ref.getbbox()
+        if rb is None:
+            raise SpineError("Origin reference export is fully transparent.")
+        # content edges relative to the Spine origin (image centre)
+        left, top = rb[0] - ref.width // 2, rb[1] - ref.height // 2
+        right, bottom = rb[2] - ref.width // 2, rb[3] - ref.height // 2
+        if mode == "center":
+            half_w = max(-left, right) + padding
+            half_h = max(-top, bottom) + padding
+            cw, ch = 2 * half_w, 2 * half_h
+        else:
+            cw, ch = canvas_width, canvas_height
+        canvas = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+        canvas.paste(content, (cw // 2 + left, ch // 2 + top))
+
+    dst = out / f"{stem}.png"
+    canvas.save(dst)
+    result = {"static": str(dst), "size": list(canvas.size), "mode": mode}
+    if mode != "trim":
+        result["origin_offsets"] = {"left": left, "top": top,
+                                    "right": right, "bottom": bottom}
+        if (rb[2] - rb[0], rb[3] - rb[1]) != content.size:
+            result["warning"] = ("origin reference bbox size differs from the "
+                                 "exported frame; alignment may be off")
     if blur_radius > 0:
         bsize = ((blur_canvas_width, blur_canvas_height)
                  if blur_canvas_width and blur_canvas_height else None)
-        bp = _create_blur_variants(paths, blur_radius, blur_extra_pad, bsize)
-        bpath = bp[stem]
-        result["blur"] = bpath
-        result["blur_size"] = list(Image.open(bpath).size)
+        bp = _create_blur_variants({stem: str(dst)}, blur_radius,
+                                   blur_extra_pad, bsize)
+        result["blur"] = bp[stem]
+        result["blur_size"] = list(Image.open(bp[stem]).size)
     return result
 
 

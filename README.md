@@ -53,6 +53,28 @@ python spine_swiss_knife.py
 3. Use each tool's action button (Fix / Apply / Remove) — a `.backup` file is always created before changes
 4. Changes propagate across tabs automatically (fresh JSON is reloaded after every action)
 
+## Headless API / CLI / MCP (for AI agents and scripts)
+
+No GUI needed; Spine must be installed (licence used by the Spine CLI).
+Pillow is required for `export_static`.
+
+| Tool | What it does |
+|------|--------------|
+| `project_info` | Skeletons, animations, skins, bone/slot counts of a `.spine` |
+| `export_json` | Export every skeleton to compact JSON + packed atlas (Mynt settings) |
+| `check_regions` | Verify every region/mesh attachment exists in the atlas (catches `Region not found in atlas`) |
+| `fix_attachment_name` | Rename an attachment string in an exported JSON (dry-run unless `apply`) |
+| `export_static` | Frame 0 of an animation as PNG (`trim` / `center` / `fixed` canvas, origin-aligned) + optional vertical blur |
+
+```bash
+# CLI (prints JSON)
+python -m spine_swiss_knife.cli check-regions --json-path joker.json --atlas-path joker.atlas
+python -m spine_swiss_knife.cli export-static --spine-file joker.spine --skeleton joker --animation idle --mode center --blur-radius 6 --out-dir out
+
+# MCP server (stdio, no extra dependencies, works on Python 3.9+)
+claude mcp add spine-swiss-knife -- python3 -m spine_swiss_knife.mcp_server
+```
+
 ## Skeleton Viewer
 
 Includes a bundled GTSpineViewer (Java) for full skeleton preview. The **Open Full Version** button launches it with the current JSON loaded.
