@@ -9,6 +9,8 @@ export-settings JSON file instead works reliably across all versions.
 uses ``--help`` (always exit 0) instead.
 """
 
+from __future__ import annotations
+
 import json as _json
 import platform
 import queue

@@ -3,6 +3,8 @@
 Supports both Spine 3.7 (skins as dict) and 3.8+ (skins as list) formats.
 """
 
+from __future__ import annotations
+
 import json
 
 

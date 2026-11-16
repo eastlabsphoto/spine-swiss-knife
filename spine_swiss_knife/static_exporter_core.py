@@ -1,5 +1,7 @@
 """Static exporter image processing — canvas normalization and blur variants."""
 
+from __future__ import annotations
+
 from pathlib import Path
 
 from PIL import Image

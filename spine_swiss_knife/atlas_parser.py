@@ -1,6 +1,9 @@
 """Spine atlas parsing and image file collection."""
 
+from __future__ import annotations
+
 import os
+import re
 
 
 def parse_atlas(atlas_path: str) -> set[str]:
@@ -27,6 +30,11 @@ def parse_atlas(atlas_path: str) -> set[str]:
             continue
 
         if raw.startswith(" ") or raw.startswith("\t"):
+            continue
+
+        # Spine 4.x "minified" atlases have unindented region properties
+        # (bounds:..., offsets:..., rotate:...) - these are not region names.
+        if re.match(r"^(bounds|offsets|offset|orig|rotate|index|split|pad|xy|size):", stripped):
             continue
 
         sprites.add(stripped)
