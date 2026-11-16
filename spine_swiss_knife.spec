@@ -19,7 +19,9 @@ a = Analysis(
         ('spine_swiss_knife/resources', 'spine_swiss_knife/resources'),
         ('GTSpineViewer_3653', 'GTSpineViewer_3653'),
     ],
-    hiddenimports=['certifi', 'numpy'],
+    hiddenimports=['certifi', 'numpy', 'PIL',
+                   'spine_swiss_knife.api', 'spine_swiss_knife.cli',
+                   'spine_swiss_knife.mcp_server', 'spine_swiss_knife.launcher'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -31,6 +33,21 @@ a = Analysis(
 )
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
+# Console build for MCP clients (Windows GUI exe is windowed and has no stdio).
+mcp_a = Analysis(
+    ['pyinstaller_mcp_entry.py'],
+    pathex=[],
+    binaries=[],
+    datas=[],
+    hiddenimports=['PIL', 'spine_swiss_knife.api', 'spine_swiss_knife.cli',
+                   'spine_swiss_knife.mcp_server'],
+    hookspath=[],
+    excludes=['PySide6', 'tkinter'],
+    cipher=block_cipher,
+    noarchive=False,
+)
+mcp_pyz = PYZ(mcp_a.pure, mcp_a.zipped_data, cipher=block_cipher)
 
 if platform.system() == 'Darwin':
     exe = EXE(
@@ -72,8 +89,20 @@ else:
         console=False,
         icon='spine_swiss_knife/resources/icon.ico',
     )
+    mcp_exe = EXE(
+        mcp_pyz, mcp_a.scripts, [],
+        exclude_binaries=True,
+        name='SpineSwissKnifeMCP',
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=False,
+        upx=False,
+        console=True,
+        icon='spine_swiss_knife/resources/icon.ico',
+    )
     coll = COLLECT(
         exe, a.binaries, a.zipfiles, a.datas,
+        mcp_exe, mcp_a.binaries, mcp_a.zipfiles, mcp_a.datas,
         strip=False,
         upx=False,
         name='SpineSwissKnife',

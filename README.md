@@ -75,6 +75,19 @@ python -m spine_swiss_knife.cli export-static --spine-file joker.spine --skeleto
 claude mcp add spine-swiss-knife -- python3 -m spine_swiss_knife.mcp_server
 ```
 
+### Using the released app / exe as the MCP server
+
+The same download works for AI agents - no Python needed:
+
+- **macOS:** `SpineSwissKnife.app/Contents/MacOS/SpineSwissKnife --mcp`
+  (also `--cli <tool> ...`)
+- **Windows:** `SpineSwissKnifeMCP.exe` next to `SpineSwissKnife.exe`
+  (the GUI exe is a windowed build without stdio, so MCP uses the console build)
+
+Open the **Claude / MCP** tab in the app: it shows the exact config snippet
+for Claude Desktop (`claude_desktop_config.json`) and the `claude mcp add`
+command for Claude Code, with the correct path for this installation.
+
 ## Skeleton Viewer
 
 Includes a bundled GTSpineViewer (Java) for full skeleton preview. The **Open Full Version** button launches it with the current JSON loaded.

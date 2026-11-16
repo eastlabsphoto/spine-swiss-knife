@@ -1,6 +1,13 @@
 """Entry point for: python -m spine_swiss_knife"""
 
 import sys
+
+from .launcher import dispatch
+
+_rc = dispatch(sys.argv)
+if _rc is not None:
+    sys.exit(_rc)
+
 from PySide6.QtWidgets import QApplication
 from .app import SpineSwissKnifeApp
 from .style import STYLESHEET

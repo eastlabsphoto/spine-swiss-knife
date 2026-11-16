@@ -640,5 +640,13 @@
   "merge.warn.slot_renamed": "Slot '{old}' → '{new}' (conflict from {source})",
   "merge.warn.anim_renamed": "Animation '{old}' → '{new}' (conflict from {source})",
   "merge.warn.event_renamed": "Event '{old}' → '{new}' (conflict from {source})",
-  "merge.warn.image_renamed": "Image '{old}' → '{new}' (different content from {source})"
+  "merge.warn.image_renamed": "Image '{old}' → '{new}' (different content from {source})",
+  "app.sidebar.mcp": "Claude / MCP",
+  "app.tip.mcp": "Connect Claude (AI) to this app via MCP",
+  "mcp.tab": "Claude / MCP",
+  "mcp.info": "Let Claude (Claude Desktop or Claude Code) use Spine Swiss Knife directly: it can inspect projects, check atlas regions, export JSON and create static images. Copy one of the snippets below, then restart Claude.",
+  "mcp.desktop_label": "Claude Desktop: add this to {path} (inside the top-level object; merge with existing \"mcpServers\" if present):",
+  "mcp.code_label": "Claude Code: run this command in a terminal:",
+  "mcp.copy": "Copy",
+  "mcp.note": "Requires the Spine editor installed and licensed (the Spine CLI is used for exports). Keep the app in a fixed folder - the path above is where it runs from now."
 }

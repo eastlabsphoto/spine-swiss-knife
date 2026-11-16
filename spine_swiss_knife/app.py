@@ -41,6 +41,7 @@ from .spine_downgrader import SpineDowngraderTab
 from .texture_unpacker import TextureUnpackerTab
 from .spine_viewer import SpineViewerTab
 from .static_exporter import StaticExporterTab
+from .mcp_setup import McpSetupTab
 from .debug_log import DebugConsole
 
 
@@ -62,6 +63,7 @@ _SIDEBAR_KEYS = [
     ("app.sidebar.flattener", "app.tip.flattener"),
     ("app.sidebar.merge", "app.tip.merge"),
     ("app.sidebar.viewer", "app.tip.viewer"),
+    ("app.sidebar.mcp", "app.tip.mcp"),
 ]
 
 
@@ -275,6 +277,7 @@ class SpineSwissKnifeApp(QMainWindow):
             ImageFlattenerTab(self._tabs, self._get_config, on_modified=notify),
             MergeSkeletonsTab(self._tabs, self._get_config),
             SpineViewerTab(self._tabs, self._get_config),
+            McpSetupTab(self._tabs, self._get_config),
         ]
 
         # Select first tool
